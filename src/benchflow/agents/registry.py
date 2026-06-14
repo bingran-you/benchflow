@@ -113,10 +113,13 @@ _JS_AGENT_PATH = (
     f"{_BENCHFLOW_BIN_PREFIX}:{_BENCHFLOW_JS_AGENT_PREFIX}/bin:"
     f"{_BENCHFLOW_NODE_PREFIX}/bin:$PATH"
 )
+# Node >=22.19 is required by current openclaw (the JS agents install
+# @latest); keep this pin at or above that floor or the openclaw ACP
+# bootstrap aborts at its runtime version check (BF-10).
 _NODE_INSTALL = (
     "export DEBIAN_FRONTEND=noninteractive; "
     f"BF_NODE_DIR={_BENCHFLOW_NODE_PREFIX}; "
-    "BF_NODE_VERSION=22.14.0; "
+    "BF_NODE_VERSION=22.20.0; "
     'if [ ! -x "$BF_NODE_DIR/bin/node" ]; then '
     "  if ! command -v curl >/dev/null 2>&1 || "
     "     ! command -v tar >/dev/null 2>&1 || "
@@ -196,6 +199,9 @@ _PI_LAUNCHER = (Path(__file__).parent / "pi_acp_launcher.py").read_text()
 
 # Path to the Harvey LAB ACP shim (runs Harvey LAB harness as an ACP agent)
 _HARVEY_LAB_SHIM = (Path(__file__).parent / "harvey_lab_acp_shim.py").read_text()
+
+# Path to the deepagents ACP shim (runs LangChain's create_deep_agent as an ACP agent)
+_DEEPAGENTS_SHIM = (Path(__file__).parent / "deepagents_acp_shim.py").read_text()
 
 
 def _json_settings_merge(path: str, mutator: str) -> str:
@@ -538,6 +544,61 @@ AGENTS: dict[str, AgentConfig] = {
         # provider-specific env vars (ANTHROPIC_API_KEY, OPENAI_API_KEY,
         # GOOGLE_API_KEY) directly; auto_inherit_env propagates these.
     ),
+    "deepagents": AgentConfig(
+        name="deepagents",
+        description="deepagents harness — runs LangChain's create_deep_agent loop "
+        "(planning, sub-agents, filesystem + shell tools) via ACP shim, driving "
+        "deepseek-v4-pro through the OpenAI-compatible provider",
+        install_cmd=(
+            "export DEBIAN_FRONTEND=noninteractive && "
+            # deepagents requires Python >=3.11, but task base images ship as low
+            # as 3.6/3.8 (ubuntu:20.04, cached CI images), so a system-python venv
+            # makes pip report "No matching distribution found for deepagents".
+            # Provision a pinned interpreter with uv (same pattern as the OpenHands
+            # install) so this works regardless of the base-image Python.
+            "( command -v curl >/dev/null 2>&1 || "
+            f"  {_apt_install('curl', 'ca-certificates')} ) && "
+            "( command -v uv >/dev/null 2>&1 || "
+            "  ( curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1 ) ) && "
+            'export PATH="$HOME/.local/bin:$PATH" && '
+            "uv venv --python 3.12 /opt/benchflow/deepagents-venv && "
+            # deepagents pulls in langchain/langchain-core/langchain-anthropic/
+            # langchain-google-genai; langchain-openai is NOT a deepagents dep but
+            # is required for the OpenAI-compatible deepseek-v4-pro chat model.
+            "uv pip install -q --python /opt/benchflow/deepagents-venv/bin/python "
+            "deepagents langchain-openai && "
+            # Let the sandbox user traverse + execute the venv interpreter and the
+            # uv-managed CPython it links to.
+            "chmod -R a+rX /opt/benchflow/deepagents-venv && "
+            "chmod o+x /root /root/.local /root/.local/share "
+            "/root/.local/share/uv /root/.local/share/uv/python 2>/dev/null; "
+            # Deploy ACP shim
+            + _install_python_script(
+                f"{_BENCHFLOW_BIN_PREFIX}/deepagents-acp-shim", _DEEPAGENTS_SHIM
+            )
+            # Verify deepagents actually imports through the pinned venv. Without
+            # this, install rc reflects only the shim-deploy's trailing `chmod +x`
+            # (the `;` above is intentionally non-fatal), so a failed `uv pip
+            # install deepagents` — the exact failure this block fixes — would
+            # report success and fail opaquely later at launch. Mirrors OpenHands'
+            # `command -v openhands` verification tail.
+            + " && /opt/benchflow/deepagents-venv/bin/python -c 'import deepagents' "
+            ">/dev/null 2>&1"
+        ),
+        launch_cmd=(
+            f"/opt/benchflow/deepagents-venv/bin/python {_BENCHFLOW_BIN_PREFIX}/deepagents-acp-shim"
+        ),
+        protocol="acp",
+        requires_env=[],  # inferred from --model at runtime (DEEPSEEK_API_KEY, etc.)
+        # api_protocol intentionally empty — the shim builds an OpenAI-compatible
+        # ChatOpenAI from BENCHFLOW_PROVIDER_BASE_URL/API_KEY (with DEEPSEEK_*
+        # fallback). Leaving it empty avoids pinning provider endpoint selection
+        # so any OpenAI-compatible provider for the requested model works.
+        # env_mapping intentionally empty — the shim reads BENCHFLOW_PROVIDER_*
+        # directly (set unconditionally by resolve_provider_env when the model
+        # carries a registered provider prefix), with DEEPSEEK_* as a fallback
+        # (auto_inherit_env propagates those).
+    ),
     "openhands": AgentConfig(
         name="openhands",
         description="OpenHands agent via ACP (multi-model, Python-based)",
@@ -703,6 +764,7 @@ AGENT_ALIASES: dict[str, str] = {
     "openhands": "openhands",
     "oh": "openhands",
     "harvey-lab": "harvey-lab-harness",
+    "deepagents": "deepagents",
 }
 
 VALID_PROTOCOLS = {"acp", "acpx"}

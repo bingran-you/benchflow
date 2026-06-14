@@ -37,7 +37,22 @@ LITELLM_MASTER_KEY_ENV = "BENCHFLOW_LITELLM_MASTER_KEY"
 #
 # Example:
 #   "minimax-m3": (0.30e-6, 1.20e-6),   # $0.30 / $1.20 per 1M in/out — VERIFY
-MODEL_COST_PER_TOKEN: dict[str, tuple[float, float]] = {}
+MODEL_COST_PER_TOKEN: dict[str, tuple[float, float]] = {
+    # deepseek-v4 is not in LiteLLM's built-in price table (it tops out at
+    # deepseek-v3.2), so a deepseek-v4 run otherwise records $0/null cost.
+    # v4 list price is not yet published — these are v3-class PLACEHOLDERS;
+    # VERIFY against api-docs.deepseek.com/quick_start/pricing before relying on
+    # absolute cost figures. (Single flat input rate uses the cache-miss price,
+    # so cache-hit-heavy runs are slightly over-counted.)
+    "deepseek-v4-pro": (
+        0.28e-6,
+        0.42e-6,
+    ),  # $0.28 / $0.42 per 1M in/out — PLACEHOLDER, VERIFY
+    "deepseek-v4-flash": (
+        0.28e-6,
+        0.42e-6,
+    ),  # $0.28 / $0.42 per 1M in/out — PLACEHOLDER, VERIFY
+}
 
 
 def custom_cost_per_token(model: str) -> tuple[float, float] | None:
@@ -50,7 +65,8 @@ def custom_cost_per_token(model: str) -> tuple[float, float] | None:
 
 
 _BEDROCK_ADAPTIVE_THINKING_RE = re.compile(
-    r"claude-(?:opus|sonnet|haiku)-4-(?:8|9|1\d)(?!\d)", re.IGNORECASE
+    r"claude-(?:(?:opus|sonnet|haiku)-4-(?:8|9|1\d)(?!\d)|fable-5(?!\d))",
+    re.IGNORECASE,
 )
 _BEDROCK_THINKING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh", "max"}
 
