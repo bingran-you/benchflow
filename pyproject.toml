@@ -1,6 +1,6 @@
 [project]
 name = "benchflow"
-version = "0.6.1"
+version = "0.6.2"
 description = "Multi-turn agent benchmarking with ACP — run any agent, any model, any provider."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -118,6 +118,7 @@ target-version = "py312"
 # smolclaws claw-* sources copied under a ClawsBench task's environment/) are
 # not BenchFlow code — do not lint them.
 extend-exclude = [
+    ".agents/skills/skill-creator",
     ".claude/skills/skill-creator",
     "benchmarks/**/tasks/**/environment/claw-*",
     "tests/fixtures/skillsbench_slice",

@@ -194,7 +194,7 @@ bench eval create -d skillsbench@1.1 --agent gemini --model gemini-3.1-flash-lit
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--config` | — | YAML config file |
-| `--tasks-dir` | — | Local task dir (single task with task.toml, or parent of many) |
+| `--tasks-dir` | — | Local task dir (single native `task.md` package, compatibility split-layout task, or parent of many) |
 | `-d`, `--dataset` | — | Registry dataset to run as `<name>@<version>` (e.g. `skillsbench@1.1`). Resolves the pinned snapshot from the registry, clones tasks at their pinned commit, verifies each task's sha256 content digest, and checks the dataset's `bench_version` range against the installed benchflow. Each `result.json`/`config.json` is stamped with `dataset_name`, `dataset_version`, and the task's `task_digest`. |
 | `--registry` | skillsbench registry | Dataset registry JSON URL or local file. Only valid with `--dataset`. |
 | `--source-repo` | — | Remote repo as `org/repo` (e.g. `benchflow-ai/skillsbench`) |
@@ -214,7 +214,7 @@ bench eval create -d skillsbench@1.1 --agent gemini --model gemini-3.1-flash-lit
 | `--sandbox` | `docker` | Sandbox: docker, daytona, or modal |
 | `--usage-tracking` | `auto` | Token usage telemetry policy: `auto`, `required`, or `off` |
 | `--environment-manifest` | — | Path to an Environment-plane manifest (`environment.toml`); applied to every rollout in the batch |
-| `--prompt` | `instruction.md` | Prompt to send to the agent; repeatable for multi-prompt runs |
+| `--prompt` | task prompt | Prompt to send to the agent; repeatable for multi-prompt runs |
 | `--concurrency` | `4` | Max concurrent tasks (batch mode only) |
 | `--build-concurrency` | `--concurrency` | Max concurrent docker image builds; set lower (e.g. `8`) when `--concurrency` is high to avoid overwhelming the docker daemon |
 | `--worker-concurrency` | — | Run batch eval through isolated worker subprocesses, each with at most this many concurrent tasks; `--concurrency` remains the aggregate target |
@@ -315,16 +315,16 @@ Scaffold a new benchmark task.
 ```bash
 bench tasks init my-new-task
 bench tasks init my-new-task --dir tasks/
-bench tasks init my-new-task --format legacy
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--format` | `task-md` | Task format: `task-md` (native single-document) or `legacy` (split `task.toml` + `instruction.md` layout) |
+| `--format` | `task-md` | Task format. New tasks use `task-md`; the legacy scaffold path is retired in v0.6.2. |
 
 ### bench tasks check
 
-Validate a task directory (`task.md` or legacy `task.toml` + `instruction.md`, `environment/Dockerfile`, `verifier/` or legacy `tests/`).
+Validate a task directory. Native packages use `task.md`, `environment/`, and
+`verifier/`; older split packages should be migrated with `bench tasks migrate`.
 
 ```bash
 bench tasks check tasks/my-task
@@ -339,9 +339,9 @@ Evidence" section of `docs/task-standard.md`.
 
 ### bench tasks migrate
 
-Convert a legacy `task.toml` + `instruction.md` task into the unified
-`task.md` format. By default the legacy files are kept alongside the new
-`task.md`.
+Convert an older split task package into the unified `task.md` format. By
+default the old files are kept alongside the new `task.md`; for publication,
+use `--remove-legacy`.
 
 ```bash
 bench tasks migrate tasks/my-task
@@ -351,7 +351,7 @@ bench tasks migrate tasks/my-task --overwrite --remove-legacy
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--overwrite` | `false` | Replace an existing task.md |
-| `--remove-legacy` | `false` | Delete split files and promote tests/solution aliases after task.md is verified |
+| `--remove-legacy` | `false` | Delete split files and promote `tests/` to `verifier/` and `solution/` to `oracle/` after `task.md` is verified |
 
 ### bench tasks normalize
 
@@ -371,14 +371,14 @@ bench tasks normalize tasks/my-task -o normalized-task.md
 
 ### bench tasks export
 
-Export a `task.md` task to a Harbor/Pier-compatible split layout, with a
-compatibility loss report written to `compatibility/export-report.json` in
-the export directory.
+Export a `task.md` task to a compatibility split package, with a compatibility
+loss report written to `compatibility/export-report.json` in the export
+directory.
 
 ```bash
 bench tasks export tasks/my-task out/my-task-split
 bench tasks export tasks/my-task --report-only
-bench tasks export tasks/my-task out/my-task-split --target pier --overwrite
+bench tasks export tasks/my-task out/my-task-split --overwrite
 ```
 
 Arguments: `TASK_DIR` (task directory to export) and optional `OUTPUT_DIR`
