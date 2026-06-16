@@ -27,7 +27,11 @@ from benchflow.acp.client import ACPClient
 from benchflow.acp.container_transport import ContainerTransport
 from benchflow.acp.types import McpServerSpec
 from benchflow.agents.protocol import ACPSessionAdapter
-from benchflow.agents.providers import find_provider, strip_provider_prefix
+from benchflow.agents.providers import (
+    find_provider,
+    find_provider_for_bare_model,
+    strip_provider_prefix,
+)
 from benchflow.agents.registry import AGENTS
 from benchflow.diagnostics import (
     AgentPromptTimeoutDiagnostic,
@@ -164,7 +168,16 @@ def _format_acp_model(model: str, agent: str) -> str:
     # the proxy never serves (the heuristic would default to anthropic/).
     if bare.startswith("benchflow-"):
         return f"openai/{bare}"
-    # Infer the models.dev provider from the bare model name
+    # Provider ownership lives in the registry: if a ProviderConfig claims this
+    # bare model family via its declared model_prefixes, route through it
+    # (e.g. mimo-v2.5 -> xiaomi, deepseek-v4-flash -> deepseek). This keeps
+    # provider/model-family knowledge in the provider registry instead of
+    # growing provider-specific branches in the runtime.
+    registry_match = find_provider_for_bare_model(bare)
+    if registry_match is not None:
+        return f"{registry_match[0]}/{bare}"
+    # Fallback: infer a models.dev provider for families without a registered
+    # ProviderConfig (e.g. openai/anthropic/google) from the bare model name.
     m = bare.lower()
     for substring, provider in _MODELSDEV_PROVIDER_HEURISTICS:
         if substring in m:
@@ -671,6 +684,7 @@ async def _prompt_with_idle_watchdog(
 
     prompt_task = asyncio.create_task(acp_client.prompt(prompt))
     last_progress = asyncio.get_event_loop().time()
+    last_activity_at = datetime.now(UTC)
     last_count = _activity_count()
     # poll_interval considers BOTH idle_timeout and wall-clock timeout so that
     # short overall budgets don't overshoot (e.g. timeout=30s with default
@@ -695,6 +709,7 @@ async def _prompt_with_idle_watchdog(
             cur_count = _activity_count()
             if cur_count > last_count:
                 last_progress = now
+                last_activity_at = datetime.now(UTC)
                 last_count = cur_count
             # An in-flight tool call means the agent is actively executing a tool
             # (e.g. a long build/test/solver shell command), not hung. Those tools
@@ -706,6 +721,7 @@ async def _prompt_with_idle_watchdog(
             # tool_call_update), so it still trips the idle path.
             elif session.pending_tool_call_ids():
                 last_progress = now
+                last_activity_at = datetime.now(UTC)
             if now - last_progress >= idle_timeout:
                 diag = IdleTimeoutDiagnostic(
                     idle_timeout_sec=idle_timeout,
@@ -714,7 +730,7 @@ async def _prompt_with_idle_watchdog(
                     n_tool_calls=len(session.tool_calls),
                     n_message_chunks=len(session.message_chunks),
                     n_thought_chunks=len(session.thought_chunks),
-                    last_activity_at=datetime.now(UTC).isoformat(),
+                    last_activity_at=last_activity_at.isoformat(),
                 )
                 raise IdleTimeoutError(
                     f"Agent idle for {idle_timeout}s with no new tool call, "

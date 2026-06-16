@@ -15,7 +15,10 @@ Required fields
 
 Common optional fields
 ----------------------
-- ``protocol``           "acp" (default) or "cli". Almost always "acp".
+- ``protocol``           "acp" (default), "cli", or "session-factory".
+                         Almost always "acp".
+- ``session_factory``    Non-ACP "module:callable" entrypoint used only when
+                         ``protocol="session-factory"``.
 - ``requires_env``       List of env var names the SDK must propagate into the
                          sandbox (e.g. ``["ANTHROPIC_API_KEY"]``). Validated at
                          run start; missing keys raise before the container
@@ -259,7 +262,10 @@ class AgentConfig:
     name: str
     install_cmd: str
     launch_cmd: str
-    protocol: str = "acp"  # "acp" or "cli"
+    protocol: str = "acp"  # "acp", "cli", or "session-factory"
+    session_factory: str = ""
+    # Non-ACP only. When protocol == "session-factory", this is a
+    # "module:callable" entrypoint that builds an Agent Protocol object.
     requires_env: list[str] = field(default_factory=list)
     description: str = ""
     skill_paths: list[str] = field(default_factory=list)
@@ -319,6 +325,7 @@ AGENTS: dict[str, AgentConfig] = {
         name="claude-agent-acp",
         description="Claude Code via ACP (Anthropic's Agent Client Protocol)",
         skill_paths=["$HOME/.claude/skills"],
+        home_dirs=[".claude"],
         # Pinned to 0.40.0: the config-option wiring below (set_config_option +
         # the "model"/"effort" ids) targets this version's ACP protocol (sdk
         # 0.24, which dropped session/set_model). The option ids are coupled to
@@ -510,6 +517,49 @@ AGENTS: dict[str, AgentConfig] = {
             'd.setdefault("tools",{})["webfetch"]=False',
         ),
         disallow_web_tools_owned_paths=["$HOME/.config/opencode"],
+    ),
+    "mimo": AgentConfig(
+        name="mimo",
+        description="MiMo Code via ACP — Xiaomi's OpenCode fork (TypeScript)",
+        skill_paths=["$HOME/.mimocode/skills"],
+        home_dirs=[".mimocode", ".config/mimocode"],
+        install_cmd=_js_agent_install("mimo", "@mimo-ai/cli@0.1.0"),
+        launch_cmd=_js_agent_launch("mimo", "acp"),
+        protocol="acp",
+        requires_env=[],  # inferred from --model at runtime
+        # MiMo Code ships a fixed endpoint for its native models.dev "xiaomi"
+        # provider, so token-plan/regional keys (XIAOMI_BASE_URL) need a config
+        # override. Written only when XIAOMI_API_KEY is present; the file holds
+        # {env:...} references (resolved by the CLI at runtime), never the key
+        # itself. The no-web-tools setup_cmd merges into this same file.
+        credential_files=[
+            CredentialFile(
+                path="{home}/.config/mimocode/mimocode.json",
+                env_source="XIAOMI_API_KEY",
+                template=(
+                    '{{"provider": {{"xiaomi": {{"options": '
+                    '{{"baseURL": "{{env:XIAOMI_BASE_URL}}", '
+                    '"apiKey": "{{env:XIAOMI_API_KEY}}"}}}}}}}}'
+                ),
+            ),
+        ],
+        acp_model_format="provider/model",
+        # MiMo Code is an OpenCode fork: `mimo acp` reports agentInfo.name="OpenCode"
+        # and uses models.dev "provider/model" ids, so set_model must send e.g.
+        # "openai/benchflow-<alias>" in proxy mode, or "xiaomi/mimo-v2.5" in
+        # non-proxy mode via the registered xiaomi provider (the ("mimo","xiaomi")
+        # models.dev heuristic in acp/runtime.py keeps that prefix intact).
+        env_mapping={
+            # Map BOTH base_url and api_key (codex-acp precedent) so the non-proxy
+            # path wires the key without an `if agent == "mimo"` core edit.
+            "BENCHFLOW_PROVIDER_BASE_URL": "OPENAI_BASE_URL",
+            "BENCHFLOW_PROVIDER_API_KEY": "OPENAI_API_KEY",
+        },
+        disallow_web_tools_setup_cmd=_json_settings_merge(
+            "$BENCHFLOW_AGENT_HOME/.config/mimocode/mimocode.json",
+            'd.setdefault("tools",{})["webfetch"]=False',
+        ),
+        disallow_web_tools_owned_paths=["$HOME/.config/mimocode"],
     ),
     "harvey-lab-harness": AgentConfig(
         name="harvey-lab-harness",
@@ -767,7 +817,7 @@ AGENT_ALIASES: dict[str, str] = {
     "deepagents": "deepagents",
 }
 
-VALID_PROTOCOLS = {"acp", "acpx"}
+VALID_PROTOCOLS = {"acp", "acpx", "session-factory"}
 
 # ---------------------------------------------------------------------------
 # The ``acpx:`` runtime-key namespace
@@ -855,6 +905,7 @@ def _acpx_wrap(config: AgentConfig) -> AgentConfig:
             f'export PATH="{_JS_AGENT_PATH}" && acpx {acpx_agent_name} --approve-all'
         ),
         protocol="acp",
+        session_factory=config.session_factory,
         requires_env=config.requires_env,
         description=f"{config.description} (via acpx)",
         skill_paths=config.skill_paths,
@@ -961,6 +1012,7 @@ def register_agent(
     launch_cmd: str,
     *,
     protocol: str = "acp",
+    session_factory: str = "",
     requires_env: list[str] | None = None,
     description: str = "",
     skill_paths: list[str] | None = None,
@@ -999,6 +1051,7 @@ def register_agent(
         install_cmd=install_cmd,
         launch_cmd=launch_cmd,
         protocol=protocol,
+        session_factory=session_factory,
         requires_env=requires_env or [],
         description=description,
         skill_paths=skill_paths or [],

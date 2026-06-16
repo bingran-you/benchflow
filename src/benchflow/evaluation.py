@@ -462,6 +462,7 @@ class EvaluationConfig:
     sandbox_user: str | None = "agent"
     sandbox_locked_paths: list[str] | None = None
     sandbox_setup_timeout: int = 120
+    skip_agent_install: bool = False
     agent_idle_timeout: int | None = 600
     context_root: str | None = None
     exclude_tasks: set[str] = field(default_factory=set)
@@ -833,6 +834,7 @@ class Evaluation:
             sandbox_user=sandbox_user,
             sandbox_locked_paths=sandbox_locked_paths,
             sandbox_setup_timeout=sandbox_setup_timeout,
+            skip_agent_install=bool(raw.get("skip_install", False)),
             agent_idle_timeout=raw.get(
                 "agent_idle_timeout_sec", raw.get("agent_idle_timeout", 600)
             ),
@@ -925,6 +927,7 @@ class Evaluation:
             sandbox_user=sandbox_user,
             sandbox_locked_paths=sandbox_locked_paths,
             sandbox_setup_timeout=sandbox_setup_timeout,
+            skip_agent_install=bool(agent_cfg.get("skip_install", False)),
             agent_idle_timeout=raw.get(
                 "agent_idle_timeout_sec", raw.get("agent_idle_timeout", 600)
             ),
@@ -1183,6 +1186,7 @@ class Evaluation:
             sandbox_user=cfg.sandbox_user,
             sandbox_locked_paths=cfg.sandbox_locked_paths,
             sandbox_setup_timeout=cfg.sandbox_setup_timeout,
+            skip_agent_install=cfg.skip_agent_install,
             agent_idle_timeout=cfg.agent_idle_timeout,
             context_root=cfg.context_root,
             skill_mode=skill_mode,
@@ -1756,12 +1760,21 @@ class Evaluation:
             "passed": audit_counts["passed"],
             "failed": audit_counts["failed"],
             "errored": audit_counts["errored"],
+            "pass": audit_counts["passed"],
+            "fail": audit_counts["failed"],
+            "error": audit_counts["errored"],
             "verifier_errored": audit_counts["verifier_errored"],
             "idle_timeout": error_category_counts.get(IDLE_TIMEOUT, 0),
             "error_categories": error_category_counts or None,
             "verifier_error_categories": verifier_error_category_counts or None,
             "score": f"{pass_rate(passed=audit_counts['passed'], total=job_result.total):.1%}",
+            "score_ratio": pass_rate(
+                passed=audit_counts["passed"], total=job_result.total
+            ),
             "score_excl_errors": f"{pass_rate_excl_errors(passed=audit_counts['passed'], failed=audit_counts['failed']):.1%}",
+            "score_excl_errors_ratio": pass_rate_excl_errors(
+                passed=audit_counts["passed"], failed=audit_counts["failed"]
+            ),
             "elapsed_sec": elapsed,
             "memory_score": job_result.memory_score,
             "memory_score_coverage": (

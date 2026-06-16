@@ -68,7 +68,29 @@ _BEDROCK_ADAPTIVE_THINKING_RE = re.compile(
     r"claude-(?:(?:opus|sonnet|haiku)-4-(?:8|9|1\d)(?!\d)|fable-5(?!\d))",
     re.IGNORECASE,
 )
-_BEDROCK_THINKING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh", "max"}
+_BEDROCK_LITELLM_EFFORT_LIMIT_RE = re.compile(
+    r"claude-(?:opus|sonnet|haiku)-4-(?:8|9|1\d)(?!\d)",
+    re.IGNORECASE,
+)
+# Efforts a user may *request*, low→high. LiteLLM 1.88.0rc1's Bedrock Converse
+# transform only accepts up to ``high`` for the Claude 4.x Bedrock IDs covered
+# by ``_BEDROCK_LITELLM_EFFORT_LIMIT_RE`` and raises BadRequestError on
+# ``xhigh``/``max`` (#737), so those requested values are clamped to the
+# accepted ceiling below before they reach the wire. Other adaptive-thinking
+# Bedrock models, such as Fable 5, keep their requested effort. Kept in sync
+# with the standalone proxy patch ``litellm_bedrock_patch`` (which cannot import
+# this module — it is deployed into the sandbox alone).
+_BEDROCK_EFFORT_LADDER = ("minimal", "low", "medium", "high", "xhigh", "max")
+_BEDROCK_THINKING_EFFORTS = set(_BEDROCK_EFFORT_LADDER)
+_BEDROCK_LITELLM_MAX_EFFORT = "high"
+
+
+def _clamp_bedrock_effort(effort: str) -> str:
+    """Clamp a requested effort to the highest LiteLLM-accepted rung (#737)."""
+    ladder = _BEDROCK_EFFORT_LADDER
+    if effort not in ladder:
+        return effort
+    return ladder[min(ladder.index(effort), ladder.index(_BEDROCK_LITELLM_MAX_EFFORT))]
 
 
 @dataclass(frozen=True)
@@ -148,6 +170,8 @@ def _bedrock_thinking_effort(model: str, env: dict[str, str]) -> str | None:
     effort = (env.get(BEDROCK_THINKING_EFFORT_ENV) or "high").strip().lower()
     if effort not in _BEDROCK_THINKING_EFFORTS:
         effort = "high"
+    if _BEDROCK_LITELLM_EFFORT_LIMIT_RE.search(model):
+        return _clamp_bedrock_effort(effort)
     return effort
 
 
@@ -235,17 +259,22 @@ def _route_registered_provider(
         if "openai-completions" in provider_cfg.all_endpoints
         else provider_cfg.api_protocol
     )
-    try:
-        api_base = resolve_base_url(
-            provider_cfg,
-            env,
-            protocol=protocol,
-        )
-    except KeyError as exc:
-        missing = ", ".join(sorted(provider_cfg.url_params.values()))
-        raise ValueError(
-            f"Provider {provider_name!r} for model {model!r} requires {missing}."
-        ) from exc
+    explicit_api_base = (env.get("BENCHFLOW_PROVIDER_BASE_URL") or "").strip()
+    explicit_api_key = (env.get("BENCHFLOW_PROVIDER_API_KEY") or "").strip()
+    if explicit_api_base and explicit_api_key:
+        api_base = explicit_api_base
+    else:
+        try:
+            api_base = resolve_base_url(
+                provider_cfg,
+                env,
+                protocol=protocol,
+            )
+        except KeyError as exc:
+            missing = ", ".join(sorted(provider_cfg.url_params.values()))
+            raise ValueError(
+                f"Provider {provider_name!r} for model {model!r} requires {missing}."
+            ) from exc
 
     # User-supplied-base_url providers (e.g. vllm) carry an empty config base_url
     # and resolve to "". Honor the runtime-supplied BENCHFLOW_PROVIDER_BASE_URL
@@ -260,10 +289,16 @@ def _route_registered_provider(
     params = {"model": upstream}
     if api_base:
         params["api_base"] = api_base
-    api_key_ref = _registered_api_key_ref(provider_cfg)
+    api_key_ref = (
+        _env_ref("BENCHFLOW_PROVIDER_API_KEY")
+        if explicit_api_base and explicit_api_key
+        else _registered_api_key_ref(provider_cfg)
+    )
     if api_key_ref:
         params["api_key"] = api_key_ref
-        if provider_cfg.auth_env:
+        if api_key_ref == _env_ref("BENCHFLOW_PROVIDER_API_KEY"):
+            required_env.append("BENCHFLOW_PROVIDER_API_KEY")
+        elif provider_cfg.auth_env:
             required_env.append(provider_cfg.auth_env)
 
     return LiteLLMRoute(
