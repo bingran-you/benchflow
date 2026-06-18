@@ -207,6 +207,7 @@ bench eval run -d skillsbench@1.1 --agent gemini --model gemini-3.1-flash-lite-p
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--config` | — | YAML config file |
+| `--run-config` | — | Explicit alias for the YAML run-config source file; equivalent to `--config` |
 | `--tasks-dir` | — | Local task dir (single native `task.md` package, compatibility split-layout task, or parent of many) |
 | `-d`, `--dataset` | — | Registry dataset to run as `<name>@<version>` (e.g. `skillsbench@1.1`). Resolves the pinned snapshot from the registry, clones tasks at their pinned commit, verifies each task's sha256 content digest, and checks the dataset's `bench_version` range against the installed benchflow. Each `result.json`/`config.json` is stamped with `dataset_name`, `dataset_version`, and the task's `task_digest`. |
 | `--registry` | skillsbench registry | Dataset registry JSON URL or local file. Only valid with `--dataset`. |
@@ -227,7 +228,9 @@ bench eval run -d skillsbench@1.1 --agent gemini --model gemini-3.1-flash-lite-p
 | `--sandbox` | `docker` | Sandbox: docker, daytona, or modal |
 | `--usage-tracking` | `auto` | Token usage telemetry policy: `auto`, `required`, or `off` |
 | `--environment-manifest` | — | Path to an Environment-plane manifest (`environment.toml`); applied to every rollout in the batch |
+| `--state` | — | S-axis environment binding; inline JSON, registry `name@version`, or manifest path. Takes precedence over `--environment-manifest` |
 | `--prompt` | task prompt | Prompt to send to the agent; repeatable for multi-prompt runs |
+| `--config-override` | — | C-axis task config overlay; inline JSON/YAML/TOML or `@file`, deep-merged into each task's resolved config |
 | `--concurrency` | `4` | Max concurrent tasks (batch mode only) |
 | `--build-concurrency` | `--concurrency` | Max concurrent docker image builds; set lower (e.g. `8`) when `--concurrency` is high to avoid overwhelming the docker daemon |
 | `--worker-concurrency` | — | Run batch eval through isolated worker subprocesses, each with at most this many concurrent tasks; `--concurrency` remains the aggregate target |
@@ -332,7 +335,7 @@ bench tasks init my-new-task --dir tasks/
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--format` | `task-md` | Task format. New tasks use `task-md`; the legacy scaffold path is retired in v0.6.2. |
+| `--format` | `task-md` | Task format. New tasks use `task-md`; the legacy scaffold path is retired. |
 
 ### bench tasks check
 
@@ -597,15 +600,17 @@ scenes:
 
 ---
 
-## bench continue
+## bench eval continue
 
 Resume a previous, unfinished (timed-out) `openhands` run to completion via
 record-replay. Standalone — it does not touch the normal run path. See
 [Continuing timed-out runs](../continue-runs.md) for the full guide.
 
 ```bash
-bench continue path/to/original/run-folder --tasks-dir path/to/tasks
+bench eval continue path/to/original/run-folder --tasks-dir path/to/tasks
 ```
+
+The original top-level `bench continue` still works as a hidden, deprecated alias.
 
 Key options: `--model` (override the live-continuation model; defaults to the
 original run's model), `--timeout`, `--output`, `--require-timeout`,
@@ -614,7 +619,7 @@ cut-point — no live model or API key needed), and `--proxy-mode` (replay
 proxy placement: `auto`, `host`, or `sandbox`; default `auto` uses
 sandbox-local replay for Daytona/Modal and host replay for Docker).
 
-### bench continue-batch
+### bench eval continue-batch
 
 Continue all timed-out OpenHands runs found under a directory tree. Discovers
 run folders (`config.json` + `trajectory/llm_trajectory.jsonl`) recursively,
@@ -622,7 +627,7 @@ continues each, and prints a JSON batch summary (exits 1 if any continuation
 failed).
 
 ```bash
-bench continue-batch path/to/jobs-root --tasks-dir path/to/tasks
+bench eval continue-batch path/to/jobs-root --tasks-dir path/to/tasks
 ```
 
 | Flag | Default | Description |
