@@ -288,7 +288,12 @@ def eval_run(
         str | None,
         typer.Option(
             "--usage-tracking",
-            help="Token usage tracking policy: auto, required, or off",
+            help=(
+                "Telemetry-enforcement policy: auto, required, or off. The "
+                "LiteLLM proxy is always used for routable agents (usage, cost, "
+                "and llm_trajectory.jsonl are always captured); this flag only "
+                "controls whether trusted telemetry is required."
+            ),
         ),
     ] = None,
     environment_manifest: Annotated[
@@ -399,6 +404,16 @@ def eval_run(
             help="Timeout (seconds) for sandbox user setup inside the environment.",
         ),
     ] = 120,
+    context_root: Annotated[
+        Path | None,
+        typer.Option(
+            "--context-root",
+            help=(
+                "Repo/build-context root used to stage Dockerfile COPY sources "
+                "for monorepo-authored local tasks."
+            ),
+        ),
+    ] = None,
     skills_dir: Annotated[
         Path | None,
         typer.Option("--skills-dir", help="Skills directory to deploy"),
@@ -505,6 +520,7 @@ def eval_run(
         jobs_dir=jobs_dir,
         sandbox_user=sandbox_user,
         sandbox_setup_timeout=sandbox_setup_timeout,
+        context_root=context_root,
         skills_dir=skills_dir,
         skill_mode=skill_mode,
         skill_creator_dir=skill_creator_dir,
