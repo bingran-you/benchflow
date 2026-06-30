@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
 
 from benchflow._utils.json_safe import dumps_finite, scrub_non_finite
-from benchflow.trajectories.types import redact_trajectory_text
+from benchflow.trajectories.types import redact_trajectory_obj
 
 PrimeSftRowMode = Literal["rollout", "exchange"]
 
@@ -61,7 +62,10 @@ class PrimeSftExportStats:
     skipped_exchanges_provider_error: int = 0
     skipped_no_assistant: int = 0
     skipped_missing_tool_defs: int = 0
+    skipped_terminal_error: int = 0
     skipped_invalid: int = 0
+    tool_call_ids_rewritten: int = 0
+    tool_messages_merged: int = 0
     sources: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -77,7 +81,10 @@ class PrimeSftExportStats:
             "skipped_exchanges_provider_error": self.skipped_exchanges_provider_error,
             "skipped_no_assistant": self.skipped_no_assistant,
             "skipped_missing_tool_defs": self.skipped_missing_tool_defs,
+            "skipped_terminal_error": self.skipped_terminal_error,
             "skipped_invalid": self.skipped_invalid,
+            "tool_call_ids_rewritten": self.tool_call_ids_rewritten,
+            "tool_messages_merged": self.tool_messages_merged,
             "sources": self.sources,
         }
 
@@ -93,8 +100,12 @@ class PrimeSftTrajectoryJsonlError(ValueError):
 
 
 def _json_line(record: dict[str, Any]) -> str:
-    raw = dumps_finite(scrub_non_finite(record), default=str)
-    return redact_trajectory_text(raw)
+    # Redact secrets in the record's string values BEFORE serializing so the
+    # emitted SFT row is always valid JSON; redacting the serialized text could
+    # split a backslash escape next to a secret and corrupt the line.
+    redacted = redact_trajectory_obj(scrub_non_finite(record))
+    redacted = _sanitize_prime_sft_row_tool_call_arguments(redacted)
+    return dumps_finite(redacted, default=str)
 
 
 def _load_json(path: Path) -> dict[str, Any] | None:
@@ -249,7 +260,7 @@ def _json_tool_call_arguments(arguments: Any) -> str:
         parsed = {}
     else:
         parsed = {"_non_object_arguments": arguments}
-    return json.dumps(parsed, sort_keys=True)
+    return dumps_finite(redact_trajectory_obj(parsed), sort_keys=True, default=str)
 
 
 def _normalize_tool_call(call: dict[str, Any], index: int = 0) -> dict[str, Any]:
@@ -326,6 +337,28 @@ def _normalize_system_messages(messages: list[dict[str, Any]]) -> list[dict[str,
             out["role"] = "user"
         normalized.append(out)
     return normalized
+
+
+def prime_sft_last_user_training_window(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+    """Return a compact prompt/completion window anchored at the last user turn.
+
+    OpenHands-style system prompts are large enough that a full conversation
+    prefix can push the first trainable assistant token beyond an 8k SFT
+    sequence. Prime-RL can then skip the row even though the JSONL is valid.
+    Keeping the latest user instruction plus the following assistant/tool turns
+    preserves the supervised action trace while moving trainable tokens into the
+    loaded context window.
+    """
+    for idx in range(len(messages) - 2, -1, -1):
+        message = messages[idx]
+        if message.get("role") != "user":
+            continue
+        completion = messages[idx + 1 :]
+        if any(item.get("role") == "assistant" for item in completion):
+            return [message], completion
+    return None
 
 
 def _messages_from_chat_request(body: dict[str, Any]) -> list[dict[str, Any]]:
@@ -601,6 +634,124 @@ def _sanitize_prime_sft_row_tool_call_arguments(row: dict[str, Any]) -> dict[str
     return out
 
 
+def _row_message_segments(
+    row: dict[str, Any],
+) -> list[tuple[Literal["messages", "prompt", "completion"], Any]]:
+    messages = row.get("messages")
+    if isinstance(messages, list) and messages:
+        return [("messages", message) for message in messages]
+    prompt = row.get("prompt")
+    completion = row.get("completion")
+    if isinstance(prompt, list) and isinstance(completion, list):
+        return [("prompt", message) for message in prompt] + [
+            ("completion", message) for message in completion
+        ]
+    return []
+
+
+def _content_join(left: Any, right: Any) -> str:
+    return "\n".join(
+        part for part in (_content_to_text(left), _content_to_text(right)) if part
+    )
+
+
+def _align_legacy_tool_call_ids(
+    segments: list[tuple[Literal["messages", "prompt", "completion"], Any]],
+) -> tuple[
+    list[tuple[Literal["messages", "prompt", "completion"], Any]], dict[str, int]
+]:
+    """Repair legacy BenchFlow rows whose provider call ids drifted.
+
+    Some historical ``results.jsonl`` artifacts preserved assistant tool-call ids
+    from one provider layer (``fc_*``) while the following tool messages used the
+    OpenAI-compatible ``call_*`` ids that the runtime sent back on the next turn.
+    Pair by message order and rewrite only when a pending assistant call exists;
+    true orphan tool outputs still fail validation.
+    """
+    out: list[tuple[Literal["messages", "prompt", "completion"], Any]] = []
+    pending: list[dict[str, Any]] = []
+    stats = {"tool_call_ids_rewritten": 0, "tool_messages_merged": 0}
+
+    for segment, raw_message in segments:
+        message = deepcopy(raw_message)
+        if not isinstance(message, dict):
+            out.append((segment, message))
+            continue
+
+        tool_calls = message.get("tool_calls")
+        if message.get("role") == "assistant" and isinstance(tool_calls, list):
+            pending.extend(
+                tool_call for tool_call in tool_calls if isinstance(tool_call, dict)
+            )
+
+        if message.get("role") == "tool":
+            tool_call_id = message.get("tool_call_id")
+            if (
+                out
+                and isinstance(out[-1][1], dict)
+                and out[-1][1].get("role") == "tool"
+                and out[-1][1].get("tool_call_id") == tool_call_id
+            ):
+                out[-1][1]["content"] = _content_join(
+                    out[-1][1].get("content"),
+                    message.get("content"),
+                )
+                stats["tool_messages_merged"] += 1
+                continue
+
+            match_index = next(
+                (
+                    idx
+                    for idx, tool_call in enumerate(pending)
+                    if tool_call.get("id") == tool_call_id
+                ),
+                None,
+            )
+            if match_index is not None:
+                pending.pop(match_index)
+            elif pending and tool_call_id:
+                tool_call = pending.pop(0)
+                if tool_call.get("id") != tool_call_id:
+                    tool_call["id"] = tool_call_id
+                    stats["tool_call_ids_rewritten"] += 1
+
+        out.append((segment, message))
+
+    return out, stats
+
+
+def _canonicalize_existing_prime_sft_row(
+    row: dict[str, Any],
+    row_num: int,
+    *,
+    sanitize_tool_call_arguments: bool = False,
+) -> tuple[dict[str, Any], dict[str, int]]:
+    out = (
+        _sanitize_prime_sft_row_tool_call_arguments(row)
+        if sanitize_tool_call_arguments
+        else dict(row)
+    )
+    segments = _row_message_segments(out)
+    if not segments:
+        validate_prime_sft_row(out, row_num)
+        return out, {"tool_call_ids_rewritten": 0, "tool_messages_merged": 0}
+
+    repaired, stats = _align_legacy_tool_call_ids(segments)
+    segment_names = {segment for segment, _ in repaired}
+    if segment_names == {"messages"}:
+        out["messages"] = [message for _, message in repaired]
+    else:
+        out.pop("messages", None)
+        out["prompt"] = [
+            message for segment, message in repaired if segment == "prompt"
+        ]
+        out["completion"] = [
+            message for segment, message in repaired if segment == "completion"
+        ]
+    validate_prime_sft_row(out, row_num)
+    return out, stats
+
+
 def validate_prime_sft_row(row: dict[str, Any], row_num: int = 1) -> None:
     leaked = sorted(BANNED_ROW_KEYS.intersection(row))
     if leaked:
@@ -744,7 +895,7 @@ def validate_prime_sft_jsonl(
 
 def _iter_prime_sft_jsonl_rows(
     path: Path, *, sanitize_tool_call_arguments: bool = False
-) -> Iterator[tuple[int, dict[str, Any]]]:
+) -> Iterator[tuple[int, dict[str, Any], dict[str, int]]]:
     with path.open("r", encoding="utf-8") as handle:
         for row_num, line in enumerate(handle, start=1):
             if not line.strip():
@@ -755,10 +906,12 @@ def _iter_prime_sft_jsonl_rows(
                 raise ValueError(f"row {row_num}: invalid JSON: {exc}") from exc
             if not isinstance(row, dict):
                 raise ValueError(f"row {row_num}: top-level row must be object")
-            if sanitize_tool_call_arguments:
-                row = _sanitize_prime_sft_row_tool_call_arguments(row)
-            validate_prime_sft_row(row, row_num)
-            yield row_num, row
+            row, repair_stats = _canonicalize_existing_prime_sft_row(
+                row,
+                row_num,
+                sanitize_tool_call_arguments=sanitize_tool_call_arguments,
+            )
+            yield row_num, row, repair_stats
 
 
 def _row_reward(row: dict[str, Any]) -> float | None:
@@ -768,16 +921,116 @@ def _row_reward(row: dict[str, Any]) -> float | None:
     return None
 
 
+def _compact_existing_prime_sft_row(
+    row: dict[str, Any],
+    *,
+    row_num: int,
+    source: Path,
+) -> dict[str, Any]:
+    """Emit a compact trainer row from a validated existing JSONL row."""
+    messages = [
+        message for message in _row_messages(row, row_num) if isinstance(message, dict)
+    ]
+    if _is_benchflow_results_row(row):
+        window = prime_sft_last_user_training_window(messages)
+        if window is not None:
+            prompt, completion = window
+            messages = prompt + completion
+    out: dict[str, Any] = {"messages": messages}
+
+    tools = row.get("tool_defs", row.get("tools"))
+    if tools is not None:
+        out["tool_defs"] = tools
+
+    reward = _row_reward(row)
+    if reward is not None:
+        out["reward"] = reward
+
+    raw_info = row.get("info")
+    info: dict[str, Any] = (
+        cast(dict[str, Any], raw_info) if isinstance(raw_info, dict) else {}
+    )
+    task_id = (
+        row.get("task_id")
+        or row.get("task_name")
+        or info.get("task_id")
+        or info.get("task_name")
+    )
+    if task_id:
+        out["task_id"] = str(task_id)
+    task_name = row.get("task_name") or info.get("task_name") or task_id
+    if task_name:
+        out["task_name"] = str(task_name)
+    if isinstance(row.get("model"), str):
+        out["model"] = row["model"]
+    elif isinstance(info.get("model"), str):
+        out["model"] = info["model"]
+    if isinstance(row.get("agent"), str):
+        out["agent"] = row["agent"]
+    elif isinstance(info.get("agent"), str):
+        out["agent"] = info["agent"]
+    if isinstance(row.get("example_id"), int):
+        out["source_example_id"] = row["example_id"]
+    if isinstance(info.get("rollout_dir"), str):
+        out["source_rollout_dir"] = info["rollout_dir"]
+    if row.get("chat_template_kwargs") is not None:
+        out["chat_template_kwargs"] = row["chat_template_kwargs"]
+    out["source_path"] = str(source)
+    out["source_index"] = row_num - 1
+    out["source_format"] = "benchflow-results-jsonl"
+    return out
+
+
+def _is_benchflow_results_row(row: dict[str, Any]) -> bool:
+    info = row.get("info")
+    if isinstance(info, dict) and info.get("source") == "benchflow":
+        return True
+    return any(
+        key in row
+        for key in (
+            "trajectory",
+            "stop_condition",
+            "token_usage",
+            "is_completed",
+            "is_truncated",
+        )
+    )
+
+
+def _benchflow_row_training_skip_reason(row: dict[str, Any]) -> str | None:
+    if not _is_benchflow_results_row(row):
+        return None
+    info = row.get("info")
+    if isinstance(info, dict) and info.get("training_ready") is False:
+        return "not_training_ready"
+    if row.get("error"):
+        return "terminal_error"
+    if row.get("is_truncated") is True:
+        return "partial_trajectory"
+    stop_condition = row.get("stop_condition")
+    if isinstance(stop_condition, str) and stop_condition not in {
+        "",
+        "agent_completed",
+    }:
+        return stop_condition
+    return None
+
+
 def _existing_prime_sft_jsonl_stats(
     path: Path,
     *,
     min_reward: float | None,
 ) -> PrimeSftExportStats:
     stats = PrimeSftExportStats(sources=[str(path)])
-    for row_num, row in _iter_prime_sft_jsonl_rows(
+    for row_num, row, repair_stats in _iter_prime_sft_jsonl_rows(
         path, sanitize_tool_call_arguments=True
     ):
+        stats.tool_call_ids_rewritten += repair_stats["tool_call_ids_rewritten"]
+        stats.tool_messages_merged += repair_stats["tool_messages_merged"]
         stats.rollouts_seen += 1
+        if _benchflow_row_training_skip_reason(row) is not None:
+            stats.skipped_terminal_error += 1
+            continue
         reward = _row_reward(row)
         if min_reward is not None and (reward is None or reward < min_reward):
             stats.skipped_reward += 1
@@ -798,14 +1051,22 @@ def _copy_existing_prime_sft_jsonl(
 ) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", encoding="utf-8") as handle:
-        for _, row in _iter_prime_sft_jsonl_rows(
+        for row_num, row, _ in _iter_prime_sft_jsonl_rows(
             source, sanitize_tool_call_arguments=True
         ):
+            if _benchflow_row_training_skip_reason(row) is not None:
+                continue
             if min_reward is not None:
                 reward = _row_reward(row)
                 if reward is None or reward < min_reward:
                     continue
-            handle.write(_json_line(row) + "\n")
+            compact = _compact_existing_prime_sft_row(
+                row,
+                row_num=row_num,
+                source=source,
+            )
+            validate_prime_sft_row(compact, row_num)
+            handle.write(_json_line(compact) + "\n")
 
 
 def normalize_prime_sft_exchange(
@@ -837,10 +1098,15 @@ def _row_from_exchange(
         return None, skip_reason
     if normalized is None:
         return None, "invalid_prime_sft_row"
+    messages = normalized.messages
+    window = prime_sft_last_user_training_window(messages)
+    if window is not None:
+        prompt, completion = window
+        messages = prompt + completion
 
     agent_result = result.get("agent_result") if isinstance(result, dict) else None
     row = {
-        "messages": normalized.messages,
+        "messages": messages,
         "tool_defs": normalized.tool_defs,
         "task_name": (result or {}).get("task_name") or rollout_dir.name,
         "source": "benchflow-llm-trajectory",
@@ -875,6 +1141,9 @@ def convert_benchflow_rollouts_to_prime_sft_rows(
         result = _load_json(rollout_dir / "result.json")
         if result is None:
             stats.skipped_no_result += 1
+            continue
+        if _result_training_skip_reason(result) is not None:
+            stats.skipped_terminal_error += 1
             continue
         reward = _reward_from_result(result)
         if min_reward is not None and (reward is None or reward < min_reward):
@@ -927,6 +1196,16 @@ def convert_benchflow_rollouts_to_prime_sft_rows(
             stats.sources.append(str(trajectory_path))
 
     return rows, stats
+
+
+def _result_training_skip_reason(result: dict[str, Any]) -> str | None:
+    if result.get("error"):
+        return "agent_error"
+    if result.get("verifier_error"):
+        return "verifier_error"
+    if result.get("partial_trajectory") is True:
+        return "partial_trajectory"
+    return None
 
 
 def export_prime_sft_jsonl(

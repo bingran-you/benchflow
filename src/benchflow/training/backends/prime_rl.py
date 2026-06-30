@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
-from collections.abc import Iterable
-from dataclasses import dataclass
+import tomllib
+from collections.abc import Iterable, Mapping
+from contextlib import suppress
+from dataclasses import dataclass, replace
+from hashlib import sha256
+from math import ceil
 from pathlib import Path
 from threading import Thread
-from typing import TextIO
+from typing import Any, TextIO
 
 from benchflow.training.run_manifest import (
     CommandRecord,
@@ -34,10 +39,21 @@ class PrimeRlSftSpec:
     work_dir: Path
     data: str | None = None
     output_dir: Path | None = None
+    compat_profile: str | None = None
     dry_run: bool = False
     follow: bool = False
     uv_no_sync: bool = False
     overrides: tuple[str, ...] = ()
+    target_examples: int | None = None
+    sync_scheduler_to_max_steps: bool = True
+    pack_function: str | None = None
+    loss_mask: str | None = None
+    model_attn: str | None = None
+    renderer_mode: str | None = None
+    tool_defs_mode: str = "preserve"
+    chat_template_kwargs: tuple[str, ...] = ()
+    message_tail_truncation: str = "off"
+    allow_unsafe_stack_flash_attn: bool = False
     force: bool = False
     cwd: Path | None = None
     publish_model: str | None = None
@@ -55,6 +71,85 @@ class PrimeRlSftResult:
     returncode: int
 
 
+@dataclass(frozen=True)
+class PrimeRlSftExposurePlan:
+    target_examples: int | None = None
+    data_batch_size: int | None = None
+    derived_max_steps: int | None = None
+    sync_scheduler_to_max_steps: bool = False
+    pack_function: str | None = None
+    loss_mask: str | None = None
+    model_attn: str | None = None
+    renderer_mode: str | None = None
+    generated_overrides: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "target_examples": self.target_examples,
+            "data_batch_size": self.data_batch_size,
+            "derived_max_steps": self.derived_max_steps,
+            "sync_scheduler_to_max_steps": self.sync_scheduler_to_max_steps,
+            "pack_function": self.pack_function,
+            "loss_mask": self.loss_mask,
+            "model_attn": self.model_attn,
+            "renderer_mode": self.renderer_mode,
+            "generated_overrides": list(self.generated_overrides),
+        }
+
+
+@dataclass(frozen=True)
+class PrimeRlSftDatasetPlan:
+    source_data: str
+    resolved_data: str
+    kind: str
+    dataset_dir: str | None = None
+    train_jsonl: str | None = None
+    tool_defs_mode: str = "preserve"
+    tool_defs_removed_rows: int | None = None
+    chat_template_kwargs: dict[str, Any] | None = None
+    chat_template_kwargs_rows: int | None = None
+    message_tail_truncation: str = "off"
+    message_tail_truncated_rows: int | None = None
+    message_tail_max_area: int | None = None
+    message_tail_max_tokens_before: int | None = None
+    message_tail_max_tokens_after: int | None = None
+    validation: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source_data": self.source_data,
+            "resolved_data": self.resolved_data,
+            "kind": self.kind,
+            "dataset_dir": self.dataset_dir,
+            "train_jsonl": self.train_jsonl,
+            "tool_defs_mode": self.tool_defs_mode,
+            "tool_defs_removed_rows": self.tool_defs_removed_rows,
+            "chat_template_kwargs": self.chat_template_kwargs,
+            "chat_template_kwargs_rows": self.chat_template_kwargs_rows,
+            "message_tail_truncation": self.message_tail_truncation,
+            "message_tail_truncated_rows": self.message_tail_truncated_rows,
+            "message_tail_max_area": self.message_tail_max_area,
+            "message_tail_max_tokens_before": self.message_tail_max_tokens_before,
+            "message_tail_max_tokens_after": self.message_tail_max_tokens_after,
+            "validation": self.validation,
+        }
+
+
+@dataclass(frozen=True)
+class PrimeRlSftLaunch:
+    argv: list[str]
+    exposure_plan: PrimeRlSftExposurePlan | None = None
+
+
+_MOBILE300_PROFILE = "env0-mobile300-pr828"
+_COMPAT_PROFILE_ALIASES = {
+    _MOBILE300_PROFILE: _MOBILE300_PROFILE,
+    "env-0-mobile300-pr828": _MOBILE300_PROFILE,
+    "env0-mobile300-custom-sft": _MOBILE300_PROFILE,
+    "env-0-mobile300-custom-sft": _MOBILE300_PROFILE,
+}
+
+
 def _parse_overrides(overrides: Iterable[str]) -> list[str]:
     argv: list[str] = []
     for override in overrides:
@@ -68,6 +163,19 @@ def _parse_overrides(overrides: Iterable[str]) -> list[str]:
     return argv
 
 
+def _override_map(overrides: Iterable[str]) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for override in overrides:
+        if "=" not in override:
+            raise ValueError(f"--override must be KEY=VALUE, got {override!r}")
+        key, value = override.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"--override must have a non-empty key: {override!r}")
+        values[key] = value
+    return values
+
+
 def _resolve_config_path(config: Path, cwd: Path | None) -> Path:
     if config.is_file():
         return config.resolve()
@@ -78,11 +186,423 @@ def _resolve_config_path(config: Path, cwd: Path | None) -> Path:
     raise ValueError(f"--config not found: {config}")
 
 
-def build_prime_rl_sft_argv(spec: PrimeRlSftSpec) -> list[str]:
+def _load_toml(path: Path) -> Mapping[str, Any]:
+    with path.open("rb") as handle:
+        data = tomllib.load(handle)
+    return data if isinstance(data, Mapping) else {}
+
+
+def _nested_config_value(data: Mapping[str, Any], key: str) -> Any:
+    current: Any = data
+    for part in key.split("."):
+        if not isinstance(current, Mapping) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def _parse_positive_int(value: Any, *, key: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{key} must be a positive integer, got {value!r}")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        parsed = int(value.strip())
+    else:
+        raise ValueError(f"{key} must be a positive integer, got {value!r}")
+    if parsed <= 0:
+        raise ValueError(f"{key} must be a positive integer, got {value!r}")
+    return parsed
+
+
+def _resolve_data_batch_size(
+    config: Mapping[str, Any], overrides: Mapping[str, str]
+) -> int:
+    raw = overrides.get("data.batch_size")
+    source = (
+        "--override data.batch_size" if raw is not None else "config data.batch_size"
+    )
+    if raw is None:
+        raw = _nested_config_value(config, "data.batch_size")
+    if raw is None:
+        raise ValueError(
+            "--target-examples requires data.batch_size in the Prime-RL config "
+            "or an explicit --override data.batch_size=..."
+        )
+    return _parse_positive_int(raw, key=source)
+
+
+def _loss_mask_overrides(raw: str) -> tuple[str, tuple[str, ...]]:
+    value = raw.strip().lower().replace("_", "-")
+    role_names = ("system", "user", "assistant", "tool")
+    role_set = set(role_names)
+    if value == "all":
+        enabled = role_set
+    elif value == "assistant":
+        enabled = {"assistant"}
+    else:
+        enabled = {part.strip().replace("_", "-") for part in value.split(",")}
+        if not enabled or any(not part for part in enabled):
+            raise ValueError(
+                "--loss-mask must be 'all', 'assistant', or comma-separated roles"
+            )
+        unknown = sorted(enabled - role_set)
+        if unknown:
+            raise ValueError(
+                "--loss-mask roles must be drawn from system,user,assistant,tool; "
+                f"got {','.join(unknown)}"
+            )
+    normalized = (
+        "all"
+        if enabled == role_set
+        else ",".join(role for role in role_names if role in enabled)
+    )
+    return normalized, tuple(
+        f"data.loss_mask.{role}={'true' if role in enabled else 'false'}"
+        for role in role_names
+    )
+
+
+def _resolve_effective_value(
+    config: Mapping[str, Any], overrides: Mapping[str, str], key: str
+) -> Any:
+    if key in overrides:
+        return overrides[key]
+    return _nested_config_value(config, key)
+
+
+def _resolve_effective_positive_int(
+    config: Mapping[str, Any],
+    overrides: Mapping[str, str],
+    key: str,
+    *,
+    default: int | None = None,
+) -> int:
+    value = _resolve_effective_value(config, overrides, key)
+    if value is None:
+        if default is None:
+            raise ValueError(f"{key} must be configured")
+        value = default
+    return _parse_positive_int(value, key=key)
+
+
+def _string_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(value)
+
+
+def _normalize_tool_defs_mode(raw: str) -> str:
+    value = raw.strip().lower().replace("_", "-")
+    aliases = {"keep": "preserve", "strip": "omit", "drop": "omit"}
+    value = aliases.get(value, value)
+    if value not in {"preserve", "omit"}:
+        raise ValueError("--tool-defs-mode must be either 'preserve' or 'omit'")
+    return value
+
+
+def _normalize_message_tail_truncation(raw: str) -> str:
+    value = raw.strip().lower().replace("_", "-")
+    aliases = {
+        "none": "off",
+        "false": "off",
+        "disabled": "off",
+        "keep-user": "keep-first-user",
+        "first-user": "keep-first-user",
+        "keep-user-suffix": "keep-first-user",
+    }
+    value = aliases.get(value, value)
+    if value not in {"off", "keep-first-user"}:
+        raise ValueError(
+            "--message-tail-truncation must be either 'off' or 'keep-first-user'"
+        )
+    return value
+
+
+def _parse_chat_template_value(raw: str) -> Any:
+    value = raw.strip()
+    if value.lower() in {"true", "false", "null"}:
+        value = value.lower()
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return raw
+
+
+def _parse_chat_template_kwargs(raw: Iterable[str]) -> dict[str, Any]:
+    values: dict[str, Any] = {}
+    for item in raw:
+        if "=" not in item:
+            raise ValueError(f"--chat-template-kwarg must be KEY=VALUE, got {item!r}")
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(
+                f"--chat-template-kwarg must have a non-empty key: {item!r}"
+            )
+        values[key] = _parse_chat_template_value(value)
+    return values
+
+
+def _profile_chat_template_kwargs(
+    raw: tuple[str, ...],
+    defaults: Mapping[str, Any],
+    *,
+    profile: str,
+) -> tuple[str, ...]:
+    values = _parse_chat_template_kwargs(raw)
+    generated: list[str] = []
+    for key, required in defaults.items():
+        if key in values:
+            if values[key] != required:
+                rendered = json.dumps(required, sort_keys=True)
+                raise ValueError(
+                    f"--compat-profile {profile} requires "
+                    f"--chat-template-kwarg {key}={rendered}; got {values[key]!r}"
+                )
+            continue
+        generated.append(f"{key}={json.dumps(required, sort_keys=True)}")
+    return (*raw, *generated)
+
+
+def _normalize_compat_profile(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    value = raw.strip().lower().replace("_", "-")
+    if not value:
+        raise ValueError("--compat-profile must be non-empty")
+    normalized = _COMPAT_PROFILE_ALIASES.get(value)
+    if normalized is None:
+        supported = ", ".join(sorted(_COMPAT_PROFILE_ALIASES))
+        raise ValueError(
+            f"Unsupported --compat-profile {raw!r}; supported profiles: {supported}"
+        )
+    return normalized
+
+
+def _profile_field(
+    value: str | int | None,
+    required: str | int,
+    *,
+    field: str,
+    profile: str,
+) -> str | int:
+    if value is None:
+        return required
+    if str(value).lower() != str(required).lower():
+        raise ValueError(
+            f"--compat-profile {profile} requires {field}={required!r}; got {value!r}"
+        )
+    return required
+
+
+def _apply_compat_profile(spec: PrimeRlSftSpec) -> PrimeRlSftSpec:
+    profile = _normalize_compat_profile(spec.compat_profile)
+    if profile is None:
+        return spec
+    if profile != _MOBILE300_PROFILE:
+        raise AssertionError(f"unhandled compat profile: {profile}")
+    if not spec.sync_scheduler_to_max_steps:
+        raise ValueError(
+            f"--compat-profile {profile} requires --sync-scheduler-to-max-steps"
+        )
+    return replace(
+        spec,
+        compat_profile=profile,
+        target_examples=int(
+            _profile_field(
+                spec.target_examples, 300, field="--target-examples", profile=profile
+            )
+        ),
+        pack_function=str(
+            _profile_field(
+                spec.pack_function, "stack", field="--pack-function", profile=profile
+            )
+        ),
+        loss_mask=str(
+            _profile_field(spec.loss_mask, "all", field="--loss-mask", profile=profile)
+        ),
+        model_attn=str(
+            _profile_field(
+                spec.model_attn, "sdpa", field="--model-attn", profile=profile
+            )
+        ),
+        renderer_mode=str(
+            _profile_field(
+                spec.renderer_mode, "none", field="--renderer-mode", profile=profile
+            )
+        ),
+        tool_defs_mode="omit",
+        chat_template_kwargs=_profile_chat_template_kwargs(
+            spec.chat_template_kwargs,
+            {"enable_thinking": False},
+            profile=profile,
+        ),
+        message_tail_truncation="keep-first-user",
+    )
+
+
+def _is_qwen35_model(model_name: str | None) -> bool:
+    if model_name is None:
+        return False
+    normalized = model_name.lower().replace("_", "-")
+    return normalized.startswith("qwen/qwen3.5-")
+
+
+def _validate_prime_rl_mode(
+    spec: PrimeRlSftSpec,
+    config: Mapping[str, Any],
+    effective_overrides: Mapping[str, str],
+) -> None:
+    pack_function = _string_or_none(
+        _resolve_effective_value(config, effective_overrides, "data.pack_function")
+    )
+    model_name = _string_or_none(
+        _resolve_effective_value(config, effective_overrides, "model.name")
+    )
+    model_attn = _string_or_none(
+        _resolve_effective_value(config, effective_overrides, "model.attn")
+    )
+    if (
+        not spec.allow_unsafe_stack_flash_attn
+        and pack_function == "stack"
+        and _is_qwen35_model(model_name)
+        and model_attn in {"flash_attention_2", "flash_attention_3", "fa4"}
+    ):
+        raise ValueError(
+            "Prime-RL stack packing with Qwen/Qwen3.5-* and flash attention is "
+            "blocked because it can misinterpret padded position_ids as packed "
+            "sequence starts and fail inside Qwen3.5 varlen kernels. Use "
+            "--model-attn sdpa or --override model.attn=sdpa for the "
+            "custom-trainer-compatible stack path, or pass "
+            "--allow-unsafe-stack-flash-attn to run the native Prime-RL mode anyway."
+        )
+
+
+def _resolve_sample_max_area(
+    config: Mapping[str, Any], overrides: Mapping[str, str]
+) -> int:
+    seq_len = _resolve_effective_positive_int(
+        config, overrides, "data.seq_len", default=128
+    )
+    micro_batch_size = _resolve_effective_positive_int(
+        config, overrides, "data.micro_batch_size", default=1
+    )
+    return seq_len * micro_batch_size
+
+
+def _build_generated_overrides(
+    spec: PrimeRlSftSpec, config: Mapping[str, Any]
+) -> PrimeRlSftExposurePlan | None:
+    overrides = _override_map(spec.overrides)
+    generated: list[str] = []
+    target_examples: int | None = None
+    data_batch_size: int | None = None
+    derived_max_steps: int | None = None
+    pack_function: str | None = None
+    loss_mask: str | None = None
+    model_attn: str | None = None
+    renderer_mode: str | None = None
+
+    if spec.target_examples is not None:
+        if "max_steps" in overrides:
+            raise ValueError(
+                "--target-examples cannot be combined with --override max_steps=..."
+            )
+        target_examples = _parse_positive_int(
+            spec.target_examples, key="--target-examples"
+        )
+        data_batch_size = _resolve_data_batch_size(config, overrides)
+        derived_max_steps = ceil(target_examples / data_batch_size)
+        generated.append(f"max_steps={derived_max_steps}")
+        if spec.sync_scheduler_to_max_steps:
+            if "scheduler.decay_steps" in overrides:
+                raise ValueError(
+                    "--sync-scheduler-to-max-steps cannot be combined with "
+                    "--override scheduler.decay_steps=..."
+                )
+            generated.append(f"scheduler.decay_steps={derived_max_steps}")
+
+    if spec.pack_function is not None:
+        if spec.pack_function not in {"cat", "stack"}:
+            raise ValueError("--pack-function must be either 'cat' or 'stack'")
+        if "data.pack_function" in overrides:
+            raise ValueError(
+                "--pack-function cannot be combined with "
+                "--override data.pack_function=..."
+            )
+        pack_function = spec.pack_function
+        generated.append(f"data.pack_function={pack_function}")
+
+    if spec.loss_mask is not None:
+        loss_keys = [
+            f"data.loss_mask.{role}" for role in ("system", "user", "assistant", "tool")
+        ]
+        conflicting = sorted(key for key in loss_keys if key in overrides)
+        if conflicting:
+            raise ValueError(
+                "--loss-mask cannot be combined with --override "
+                + ", ".join(f"{key}=..." for key in conflicting)
+            )
+        loss_mask, loss_overrides = _loss_mask_overrides(spec.loss_mask)
+        generated.extend(loss_overrides)
+
+    if spec.model_attn is not None:
+        model_attn = spec.model_attn.strip()
+        if not model_attn:
+            raise ValueError("--model-attn must be non-empty")
+        if "model.attn" in overrides:
+            raise ValueError(
+                "--model-attn cannot be combined with --override model.attn=..."
+            )
+        generated.append(f"model.attn={model_attn}")
+
+    if spec.renderer_mode is not None:
+        renderer_mode = spec.renderer_mode.strip().lower().replace("_", "-")
+        if renderer_mode != "none":
+            raise ValueError("--renderer-mode currently supports only 'none'")
+        conflicting = sorted(
+            key for key in overrides if key == "renderer" or key.startswith("renderer.")
+        )
+        if conflicting:
+            raise ValueError(
+                "--renderer-mode cannot be combined with --override "
+                + ", ".join(f"{key}=..." for key in conflicting)
+            )
+        generated.append("renderer=None")
+
+    effective_overrides = _override_map((*spec.overrides, *generated))
+    _validate_prime_rl_mode(spec, config, effective_overrides)
+
+    if not generated:
+        return None
+    return PrimeRlSftExposurePlan(
+        target_examples=target_examples,
+        data_batch_size=data_batch_size,
+        derived_max_steps=derived_max_steps,
+        sync_scheduler_to_max_steps=(
+            bool(spec.sync_scheduler_to_max_steps)
+            if target_examples is not None
+            else False
+        ),
+        pack_function=pack_function,
+        loss_mask=loss_mask,
+        model_attn=model_attn,
+        renderer_mode=renderer_mode,
+        generated_overrides=tuple(generated),
+    )
+
+
+def build_prime_rl_sft_launch(spec: PrimeRlSftSpec) -> PrimeRlSftLaunch:
     config = _resolve_config_path(spec.config, spec.cwd)
+    config_data = _load_toml(config)
     work_dir = spec.work_dir.resolve()
     output_dir = (
         spec.output_dir.resolve() if spec.output_dir else work_dir / "prime-rl-output"
+    )
+    exposure_plan = _build_generated_overrides(spec, config_data)
+    effective_overrides = spec.overrides + (
+        exposure_plan.generated_overrides if exposure_plan is not None else ()
     )
     argv = ["uv", "run"]
     if spec.uv_no_sync:
@@ -93,8 +613,12 @@ def build_prime_rl_sft_argv(spec: PrimeRlSftSpec) -> list[str]:
     argv.extend(["--output-dir", str(output_dir)])
     if spec.dry_run:
         argv.append("--dry-run")
-    argv.extend(_parse_overrides(spec.overrides))
-    return argv
+    argv.extend(_parse_overrides(effective_overrides))
+    return PrimeRlSftLaunch(argv=argv, exposure_plan=exposure_plan)
+
+
+def build_prime_rl_sft_argv(spec: PrimeRlSftSpec) -> list[str]:
+    return build_prime_rl_sft_launch(spec).argv
 
 
 def _recorded_env_keys() -> list[str]:
@@ -115,8 +639,551 @@ def _copy_stream(stream: TextIO, handle: TextIO, *, echo: bool) -> None:
             print(line, end="", flush=True)
 
 
+def _local_data_path(data: str) -> Path | None:
+    path = Path(data).expanduser()
+    if path.exists():
+        return path.resolve()
+    if path.suffix == ".jsonl":
+        raise ValueError(f"--data JSONL file not found: {data}")
+    return None
+
+
+@dataclass(frozen=True)
+class _JsonlTransformStats:
+    tool_defs_removed_rows: int | None = None
+    chat_template_kwargs_rows: int | None = None
+    message_tail_truncated_rows: int | None = None
+    message_tail_max_area: int | None = None
+    message_tail_max_tokens_before: int | None = None
+    message_tail_max_tokens_after: int | None = None
+
+
+def _sha256_file(path: Path) -> str:
+    digest = sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _staged_dataset_dir(work_dir: Path) -> Path:
+    dataset_dir = work_dir / "prime-rl-dataset-staging"
+    if dataset_dir.exists():
+        shutil.rmtree(dataset_dir)
+    return dataset_dir
+
+
+def _finalize_staged_dataset_dir(work_dir: Path, dataset_dir: Path) -> Path:
+    train_jsonl = dataset_dir / "train.jsonl"
+    digest = _sha256_file(train_jsonl)[:12]
+    final_dir = work_dir / f"prime-rl-dataset-{digest}"
+    if final_dir.exists():
+        shutil.rmtree(final_dir)
+    dataset_dir.rename(final_dir)
+    return final_dir
+
+
+def _load_tail_truncation_tokenizer(model_name: str) -> Any:
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as exc:
+        raise ValueError(
+            "--message-tail-truncation requires transformers in the active "
+            "environment so BenchFlow can match Prime-RL tokenizer lengths"
+        ) from exc
+    return AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
+
+def _normalize_messages_for_prime_rl_render(
+    messages: Any, *, default_role: str = "assistant"
+) -> list[dict[str, Any]]:
+    if messages is None:
+        return []
+    if isinstance(messages, str):
+        normalized = [{"role": default_role, "content": messages}]
+    elif isinstance(messages, Mapping):
+        normalized = [dict(messages)]
+    elif isinstance(messages, list):
+        normalized = []
+        for message in messages:
+            if isinstance(message, str):
+                normalized.append({"role": default_role, "content": message})
+            elif isinstance(message, Mapping):
+                normalized.append(dict(message))
+            else:
+                raise ValueError(
+                    f"Unsupported message type in Prime-RL row: {type(message)}"
+                )
+    else:
+        raise ValueError(
+            f"Unsupported messages container in Prime-RL row: {type(messages)}"
+        )
+
+    out: list[dict[str, Any]] = []
+    for message in normalized:
+        item = dict(message)
+        content = item.get("content")
+        if isinstance(content, str):
+            item["content"] = content.strip()
+        if "tool_calls" in item:
+            tool_calls = []
+            for tool_call in item.get("tool_calls") or []:
+                if not isinstance(tool_call, Mapping):
+                    raise ValueError("tool_calls entries must be objects")
+                call = dict(tool_call)
+                function = dict(call.get("function") or {})
+                arguments = function.get("arguments")
+                if isinstance(arguments, str):
+                    with suppress(json.JSONDecodeError):
+                        arguments = json.loads(arguments)
+                function["arguments"] = arguments
+                call["function"] = function
+                tool_calls.append(call)
+            item["tool_calls"] = tool_calls
+        out.append(item)
+    return out
+
+
+def _prime_rl_tools_from_row(row: Mapping[str, Any]) -> list[dict[str, Any]] | None:
+    raw_tools = row.get("tools", row.get("tool_defs"))
+    if not raw_tools:
+        return None
+    if isinstance(raw_tools, str):
+        raw_tools = json.loads(raw_tools)
+    if not isinstance(raw_tools, list):
+        raise ValueError("tools/tool_defs must be a list or JSON-encoded list")
+
+    tools: list[dict[str, Any]] = []
+    for item in raw_tools:
+        if not isinstance(item, Mapping):
+            raise ValueError("tools/tool_defs entries must be objects")
+        tool = dict(item)
+        if tool.get("type") == "function" and isinstance(tool.get("function"), Mapping):
+            tools.append(tool)
+            continue
+        function = {
+            "name": tool.get("name"),
+            "description": tool.get("description"),
+            "parameters": tool.get("parameters"),
+        }
+        if tool.get("strict") is not None:
+            function["strict"] = tool["strict"]
+        tools.append({"type": "function", "function": function})
+    return tools
+
+
+def _render_prime_rl_row_token_ids(
+    tokenizer: Any,
+    row: Mapping[str, Any],
+    messages: list[dict[str, Any]],
+    *,
+    tools: list[dict[str, Any]] | None,
+    chat_template_kwargs: Mapping[str, Any],
+) -> list[int]:
+    kwargs = dict(chat_template_kwargs)
+    kwargs["add_generation_prompt"] = False
+    kwargs["return_dict"] = False
+    if tools is not None:
+        kwargs["tools"] = tools
+    rendered = tokenizer.apply_chat_template(
+        _normalize_messages_for_prime_rl_render(messages),
+        **kwargs,
+    )
+    return list(rendered)
+
+
+def _prime_rl_effective_sample_len(tokenizer: Any, token_ids: list[int]) -> int:
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is not None and eos_token_id in token_ids:
+        return max(0, len(token_ids) - 1)
+    return len(token_ids)
+
+
+def _row_effective_sample_len(
+    tokenizer: Any,
+    row: Mapping[str, Any],
+    messages: list[dict[str, Any]],
+    *,
+    tools: list[dict[str, Any]] | None,
+    chat_template_kwargs: Mapping[str, Any],
+) -> int:
+    token_ids = _render_prime_rl_row_token_ids(
+        tokenizer,
+        row,
+        messages,
+        tools=tools,
+        chat_template_kwargs=chat_template_kwargs,
+    )
+    return _prime_rl_effective_sample_len(tokenizer, token_ids)
+
+
+def _tail_truncate_messages_keep_first_user(
+    tokenizer: Any,
+    row: Mapping[str, Any],
+    *,
+    max_area: int,
+    tools: list[dict[str, Any]] | None,
+    chat_template_kwargs: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], int, int, bool]:
+    raw_messages = row.get("messages")
+    messages = (
+        [dict(message) for message in raw_messages]
+        if isinstance(raw_messages, list)
+        else _normalize_messages_for_prime_rl_render(raw_messages)
+    )
+    before = _row_effective_sample_len(
+        tokenizer,
+        row,
+        messages,
+        tools=tools,
+        chat_template_kwargs=chat_template_kwargs,
+    )
+    if before <= max_area:
+        return messages, before, before, False
+
+    first_user_idx = next(
+        (idx for idx, message in enumerate(messages) if message.get("role") == "user"),
+        None,
+    )
+    if first_user_idx is None:
+        raise ValueError(
+            "cannot tail-truncate an overlength Prime-RL row without a user message"
+        )
+
+    first_user = [messages[first_user_idx]]
+    low = first_user_idx + 1
+    high = len(messages)
+    best_start: int | None = None
+    best_len: int | None = None
+    length_cache: dict[int, int] = {}
+
+    def length_for(start: int) -> int:
+        cached = length_cache.get(start)
+        if cached is not None:
+            return cached
+        length = _row_effective_sample_len(
+            tokenizer,
+            row,
+            first_user + messages[start:],
+            tools=tools,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+        length_cache[start] = length
+        return length
+
+    while low < high:
+        mid = (low + high) // 2
+        try:
+            candidate_len = length_for(mid)
+        except Exception:
+            low = mid + 1
+            continue
+        if candidate_len <= max_area:
+            best_start = mid
+            best_len = candidate_len
+            high = mid
+        else:
+            low = mid + 1
+
+    if best_start is not None:
+        assert best_len is not None
+        start = best_start
+        while start > first_user_idx + 1:
+            try:
+                previous_len = length_for(start - 1)
+            except Exception:
+                break
+            if previous_len > max_area:
+                break
+            start -= 1
+            best_len = previous_len
+        return first_user + messages[start:], before, int(best_len), True
+
+    only_user_len = _row_effective_sample_len(
+        tokenizer,
+        row,
+        first_user,
+        tools=tools,
+        chat_template_kwargs=chat_template_kwargs,
+    )
+    if only_user_len > max_area:
+        raise ValueError(
+            "cannot tail-truncate Prime-RL row: first user message alone exceeds "
+            f"the sample window ({only_user_len} > {max_area})"
+        )
+    return first_user, before, only_user_len, True
+
+
+def _copy_prime_rl_jsonl(
+    source: Path,
+    destination: Path,
+    *,
+    omit_tool_defs: bool,
+    chat_template_kwargs: Mapping[str, Any],
+    message_tail_truncation: str,
+    tokenizer: Any | None,
+    message_tail_max_area: int | None,
+) -> _JsonlTransformStats:
+    """Copy JSONL while applying BenchFlow-owned Prime-RL data transforms."""
+    removed_rows = 0
+    chat_template_kwargs_rows = 0
+    message_tail_truncated_rows = 0
+    max_tokens_before: int | None = None
+    max_tokens_after: int | None = None
+    with (
+        source.open("r", encoding="utf-8") as src,
+        destination.open("w", encoding="utf-8") as dst,
+    ):
+        for line in src:
+            if not line.strip():
+                dst.write(line)
+                continue
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                raise ValueError(f"{source}: every JSONL row must be an object")
+            if omit_tool_defs and ("tool_defs" in row or "tools" in row):
+                removed_rows += 1
+            if omit_tool_defs:
+                row.pop("tool_defs", None)
+                row.pop("tools", None)
+            if chat_template_kwargs:
+                existing = row.get("chat_template_kwargs")
+                if existing is None:
+                    existing = {}
+                if not isinstance(existing, dict):
+                    raise ValueError(
+                        f"{source}: chat_template_kwargs must be an object when present"
+                    )
+                row["chat_template_kwargs"] = {
+                    **existing,
+                    **dict(chat_template_kwargs),
+                }
+                chat_template_kwargs_rows += 1
+            if message_tail_truncation != "off":
+                if tokenizer is None or message_tail_max_area is None:
+                    raise AssertionError(
+                        "tail truncation requires tokenizer and max area"
+                    )
+                tools = _prime_rl_tools_from_row(row)
+                row_chat_template_kwargs = row.get("chat_template_kwargs") or {}
+                if not isinstance(row_chat_template_kwargs, Mapping):
+                    raise ValueError(
+                        f"{source}: chat_template_kwargs must be an object when present"
+                    )
+                messages, before, after, changed = (
+                    _tail_truncate_messages_keep_first_user(
+                        tokenizer,
+                        row,
+                        max_area=message_tail_max_area,
+                        tools=tools,
+                        chat_template_kwargs=row_chat_template_kwargs,
+                    )
+                )
+                max_tokens_before = (
+                    before
+                    if max_tokens_before is None
+                    else max(max_tokens_before, before)
+                )
+                max_tokens_after = (
+                    after if max_tokens_after is None else max(max_tokens_after, after)
+                )
+                if changed:
+                    row["messages"] = messages
+                    message_tail_truncated_rows += 1
+            dst.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+    return _JsonlTransformStats(
+        tool_defs_removed_rows=removed_rows if omit_tool_defs else None,
+        chat_template_kwargs_rows=(
+            chat_template_kwargs_rows if chat_template_kwargs else None
+        ),
+        message_tail_truncated_rows=(
+            message_tail_truncated_rows if message_tail_truncation != "off" else None
+        ),
+        message_tail_max_area=(
+            message_tail_max_area if message_tail_truncation != "off" else None
+        ),
+        message_tail_max_tokens_before=max_tokens_before,
+        message_tail_max_tokens_after=max_tokens_after,
+    )
+
+
+def _prepare_prime_rl_data(
+    spec: PrimeRlSftSpec, work_dir: Path, config: Mapping[str, Any]
+) -> tuple[PrimeRlSftSpec, PrimeRlSftDatasetPlan | None]:
+    """Make local BenchFlow JSONL usable by Prime-RL's ``load_dataset`` path."""
+    message_tail_truncation = _normalize_message_tail_truncation(
+        spec.message_tail_truncation
+    )
+    if not spec.data:
+        if spec.chat_template_kwargs:
+            raise ValueError("--chat-template-kwarg requires --data")
+        if message_tail_truncation != "off":
+            raise ValueError("--message-tail-truncation requires --data")
+        return spec, None
+
+    tool_defs_mode = _normalize_tool_defs_mode(spec.tool_defs_mode)
+    chat_template_kwargs = _parse_chat_template_kwargs(spec.chat_template_kwargs)
+    effective_overrides = _override_map(spec.overrides)
+    message_tail_max_area: int | None = None
+    tokenizer: Any | None = None
+    if message_tail_truncation != "off":
+        model_name = _string_or_none(
+            _resolve_effective_value(config, effective_overrides, "model.name")
+        )
+        if not model_name:
+            raise ValueError(
+                "--message-tail-truncation requires model.name in the Prime-RL config "
+                "or an explicit --override model.name=..."
+            )
+        message_tail_max_area = _resolve_sample_max_area(config, effective_overrides)
+        tokenizer = _load_tail_truncation_tokenizer(model_name)
+
+    source_path = _local_data_path(spec.data)
+    if source_path is None:
+        if tool_defs_mode != "preserve":
+            raise ValueError(
+                "--tool-defs-mode omit requires --data to be a local JSONL file "
+                "or a local dataset directory"
+            )
+        if chat_template_kwargs:
+            raise ValueError(
+                "--chat-template-kwarg requires --data to be a local JSONL file "
+                "or a local dataset directory"
+            )
+        if message_tail_truncation != "off":
+            raise ValueError(
+                "--message-tail-truncation requires --data to be a local JSONL "
+                "file or a local dataset directory"
+            )
+        return spec, None
+
+    if source_path.is_dir():
+        train_jsonl = source_path / "train.jsonl"
+        validation = None
+        if train_jsonl.is_file():
+            from benchflow.trajectories.export_prime_sft import (
+                validate_prime_sft_jsonl,
+            )
+
+            validation = validate_prime_sft_jsonl(train_jsonl)
+        should_transform = (
+            tool_defs_mode == "omit"
+            or bool(chat_template_kwargs)
+            or message_tail_truncation != "off"
+        )
+        if should_transform:
+            if not train_jsonl.is_file():
+                raise ValueError(
+                    f"local Prime-RL data transforms require {source_path} "
+                    "to contain train.jsonl"
+                )
+            dataset_dir = _staged_dataset_dir(work_dir)
+            shutil.copytree(source_path, dataset_dir)
+            transformed_train_jsonl = dataset_dir / "train.jsonl"
+            stats = _copy_prime_rl_jsonl(
+                train_jsonl,
+                transformed_train_jsonl,
+                omit_tool_defs=tool_defs_mode == "omit",
+                chat_template_kwargs=chat_template_kwargs,
+                message_tail_truncation=message_tail_truncation,
+                tokenizer=tokenizer,
+                message_tail_max_area=message_tail_max_area,
+            )
+            dataset_dir = _finalize_staged_dataset_dir(work_dir, dataset_dir)
+            transformed_train_jsonl = dataset_dir / "train.jsonl"
+            resolved_spec = replace(spec, data=str(dataset_dir))
+            return resolved_spec, PrimeRlSftDatasetPlan(
+                source_data=spec.data,
+                resolved_data=str(dataset_dir),
+                kind="local_dataset_dir_transformed",
+                dataset_dir=str(dataset_dir),
+                train_jsonl=str(transformed_train_jsonl),
+                tool_defs_mode=tool_defs_mode,
+                tool_defs_removed_rows=stats.tool_defs_removed_rows,
+                chat_template_kwargs=(
+                    dict(chat_template_kwargs) if chat_template_kwargs else None
+                ),
+                chat_template_kwargs_rows=stats.chat_template_kwargs_rows,
+                message_tail_truncation=message_tail_truncation,
+                message_tail_truncated_rows=stats.message_tail_truncated_rows,
+                message_tail_max_area=stats.message_tail_max_area,
+                message_tail_max_tokens_before=stats.message_tail_max_tokens_before,
+                message_tail_max_tokens_after=stats.message_tail_max_tokens_after,
+                validation=validation,
+            )
+        resolved_spec = replace(spec, data=str(source_path))
+        return resolved_spec, PrimeRlSftDatasetPlan(
+            source_data=spec.data,
+            resolved_data=str(source_path),
+            kind="local_dataset_dir",
+            dataset_dir=str(source_path),
+            train_jsonl=str(train_jsonl) if train_jsonl.is_file() else None,
+            tool_defs_mode=tool_defs_mode,
+            chat_template_kwargs=(
+                dict(chat_template_kwargs) if chat_template_kwargs else None
+            ),
+            message_tail_truncation=message_tail_truncation,
+            validation=validation,
+        )
+
+    if source_path.suffix != ".jsonl":
+        raise ValueError(
+            f"--data local files must be Prime-SFT JSONL files, got {source_path}"
+        )
+
+    from benchflow.trajectories.export_prime_sft import validate_prime_sft_jsonl
+
+    validation = validate_prime_sft_jsonl(source_path)
+    dataset_dir = _staged_dataset_dir(work_dir)
+    dataset_dir.mkdir(parents=True)
+    train_jsonl = dataset_dir / "train.jsonl"
+    stats = _JsonlTransformStats()
+    if (
+        tool_defs_mode == "omit"
+        or chat_template_kwargs
+        or message_tail_truncation != "off"
+    ):
+        stats = _copy_prime_rl_jsonl(
+            source_path,
+            train_jsonl,
+            omit_tool_defs=tool_defs_mode == "omit",
+            chat_template_kwargs=chat_template_kwargs,
+            message_tail_truncation=message_tail_truncation,
+            tokenizer=tokenizer,
+            message_tail_max_area=message_tail_max_area,
+        )
+    else:
+        shutil.copy2(source_path, train_jsonl)
+    dataset_dir = _finalize_staged_dataset_dir(work_dir, dataset_dir)
+    train_jsonl = dataset_dir / "train.jsonl"
+    resolved_spec = replace(spec, data=str(dataset_dir))
+    return resolved_spec, PrimeRlSftDatasetPlan(
+        source_data=spec.data,
+        resolved_data=str(dataset_dir),
+        kind="local_jsonl_packaged",
+        dataset_dir=str(dataset_dir),
+        train_jsonl=str(train_jsonl),
+        tool_defs_mode=tool_defs_mode,
+        tool_defs_removed_rows=stats.tool_defs_removed_rows,
+        chat_template_kwargs=(
+            dict(chat_template_kwargs) if chat_template_kwargs else None
+        ),
+        chat_template_kwargs_rows=stats.chat_template_kwargs_rows,
+        message_tail_truncation=message_tail_truncation,
+        message_tail_truncated_rows=stats.message_tail_truncated_rows,
+        message_tail_max_area=stats.message_tail_max_area,
+        message_tail_max_tokens_before=stats.message_tail_max_tokens_before,
+        message_tail_max_tokens_after=stats.message_tail_max_tokens_after,
+        validation=validation,
+    )
+
+
 def _initial_manifest(
-    spec: PrimeRlSftSpec, argv: list[str], logs: list[str]
+    spec: PrimeRlSftSpec,
+    argv: list[str],
+    logs: list[str],
+    exposure_plan: PrimeRlSftExposurePlan | None = None,
+    dataset_plan: PrimeRlSftDatasetPlan | None = None,
 ) -> TrainRunManifest:
     work_dir = spec.work_dir.resolve()
     output_dir = (
@@ -136,7 +1203,7 @@ def _initial_manifest(
         logs=logs,
     )
     now = utc_now()
-    return TrainRunManifest(
+    manifest = TrainRunManifest(
         schema_version=1,
         run_type="sft",
         backend="prime-rl",
@@ -150,12 +1217,47 @@ def _initial_manifest(
         commands=[command],
         components=[component],
     )
+    if exposure_plan is not None:
+        manifest.extra["prime_rl_sft_exposure_plan"] = exposure_plan.to_dict()
+    if dataset_plan is not None:
+        manifest.extra["prime_rl_sft_dataset"] = dataset_plan.to_dict()
+    if spec.compat_profile:
+        manifest.extra["prime_rl_sft_compat_profile"] = {
+            "name": spec.compat_profile,
+            "description": (
+                "BenchFlow Mobile300 PR828 Prime-RL wrapper settings that match "
+                "the historical custom-trainer run where Prime-SFT rows had "
+                "tool_defs but no tools and Qwen3.5 thinking was disabled in the "
+                "chat-template render."
+            ),
+            "resolved_settings": {
+                "target_examples": spec.target_examples,
+                "sync_scheduler_to_max_steps": spec.sync_scheduler_to_max_steps,
+                "pack_function": spec.pack_function,
+                "loss_mask": spec.loss_mask,
+                "model_attn": spec.model_attn,
+                "renderer_mode": spec.renderer_mode,
+                "tool_defs_mode": spec.tool_defs_mode,
+                "chat_template_kwargs": _parse_chat_template_kwargs(
+                    spec.chat_template_kwargs
+                ),
+                "message_tail_truncation": spec.message_tail_truncation,
+            },
+            "known_prime_rl_gap": (
+                "Prime-RL still owns sequence packing; BenchFlow only stages "
+                "local rows to avoid known head truncation where possible and "
+                "does not patch Prime-RL internals."
+            ),
+        }
+    return manifest
 
 
 def run_prime_rl_sft(spec: PrimeRlSftSpec) -> PrimeRlSftResult:
+    spec = _apply_compat_profile(spec)
     if spec.cwd is not None and not spec.cwd.is_dir():
         raise ValueError(f"--prime-rl-dir not found: {spec.cwd}")
-    _resolve_config_path(spec.config, spec.cwd)
+    config_path = _resolve_config_path(spec.config, spec.cwd)
+    config_data = _load_toml(config_path)
     work_dir = spec.work_dir.resolve()
     manifest_path = work_dir / "train-run.json"
     if manifest_path.exists() and not spec.force:
@@ -172,15 +1274,19 @@ def run_prime_rl_sft(spec: PrimeRlSftSpec) -> PrimeRlSftResult:
     stderr_path = log_dir / "stderr.log"
     command_path = work_dir / "command.txt"
 
-    argv = build_prime_rl_sft_argv(spec)
+    launch_spec, dataset_plan = _prepare_prime_rl_data(spec, work_dir, config_data)
+    launch = build_prime_rl_sft_launch(launch_spec)
+    argv = launch.argv
     command_path.write_text(_shell_quote(argv) + "\n", encoding="utf-8")
     manifest = _initial_manifest(
-        spec,
+        launch_spec,
         argv,
         [
             str(stdout_path.relative_to(work_dir)),
             str(stderr_path.relative_to(work_dir)),
         ],
+        launch.exposure_plan,
+        dataset_plan,
     )
     manifest.overall_status = "running"
     manifest.components[0].status = "running"

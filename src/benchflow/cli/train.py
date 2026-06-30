@@ -233,6 +233,16 @@ def register_train(app: typer.Typer) -> None:
                 help="Prime-RL trainer output dir. Defaults to <work-dir>/prime-rl-output.",
             ),
         ] = None,
+        compat_profile: Annotated[
+            str | None,
+            typer.Option(
+                "--compat-profile",
+                help=(
+                    "Named BenchFlow Prime-RL SFT compatibility profile. "
+                    "Currently supports env0-mobile300-pr828."
+                ),
+            ),
+        ] = None,
         work_dir: Annotated[
             Path,
             typer.Option("--work-dir", help="BenchFlow training run directory"),
@@ -269,6 +279,103 @@ def register_train(app: typer.Typer) -> None:
                 help="Prime-RL config override as KEY=VALUE; repeatable",
             ),
         ] = None,
+        target_examples: Annotated[
+            int | None,
+            typer.Option(
+                "--target-examples",
+                help=(
+                    "Derive Prime-RL max_steps from a target number of training "
+                    "examples using data.batch_size"
+                ),
+            ),
+        ] = None,
+        sync_scheduler_to_max_steps: Annotated[
+            bool,
+            typer.Option(
+                "--sync-scheduler-to-max-steps/--no-sync-scheduler-to-max-steps",
+                help=(
+                    "When --target-examples is set, also derive "
+                    "scheduler.decay_steps from the computed max_steps"
+                ),
+            ),
+        ] = True,
+        pack_function: Annotated[
+            str | None,
+            typer.Option(
+                "--pack-function",
+                help="Optional first-class Prime-RL data.pack_function override: cat or stack",
+            ),
+        ] = None,
+        loss_mask: Annotated[
+            str | None,
+            typer.Option(
+                "--loss-mask",
+                help=(
+                    "Optional first-class Prime-RL data.loss_mask override: "
+                    "'assistant', 'all', or comma-separated roles"
+                ),
+            ),
+        ] = None,
+        model_attn: Annotated[
+            str | None,
+            typer.Option(
+                "--model-attn",
+                help="Optional first-class Prime-RL model.attn override, e.g. sdpa",
+            ),
+        ] = None,
+        renderer_mode: Annotated[
+            str | None,
+            typer.Option(
+                "--renderer-mode",
+                help=(
+                    "Optional Prime-RL renderer mode override. Use 'none' to "
+                    "fall back to tokenizer.apply_chat_template tokenization."
+                ),
+            ),
+        ] = None,
+        tool_defs_mode: Annotated[
+            str,
+            typer.Option(
+                "--tool-defs-mode",
+                help=(
+                    "How local training JSONL exposes tool schemas to Prime-RL: "
+                    "preserve or omit"
+                ),
+            ),
+        ] = "preserve",
+        chat_template_kwarg: Annotated[
+            list[str] | None,
+            typer.Option(
+                "--chat-template-kwarg",
+                help=(
+                    "Apply KEY=VALUE to every local Prime-SFT row's "
+                    "chat_template_kwargs before Prime-RL loads it; repeatable. "
+                    "Values are parsed as JSON literals when possible."
+                ),
+            ),
+        ] = None,
+        message_tail_truncation: Annotated[
+            str,
+            typer.Option(
+                "--message-tail-truncation",
+                help=(
+                    "Local Prime-SFT row truncation before Prime-RL tokenizes it: "
+                    "off or keep-first-user. The keep-first-user mode keeps the "
+                    "initial user instruction plus the longest final message "
+                    "suffix that fits data.seq_len * data.micro_batch_size."
+                ),
+            ),
+        ] = "off",
+        allow_unsafe_stack_flash_attn: Annotated[
+            bool,
+            typer.Option(
+                "--allow-unsafe-stack-flash-attn",
+                help=(
+                    "Allow Qwen3.5 stack packing with flash attention despite "
+                    "known Prime-RL varlen-kernel risk"
+                ),
+            ),
+        ] = False,
         force: Annotated[
             bool,
             typer.Option(
@@ -326,10 +433,21 @@ def register_train(app: typer.Typer) -> None:
                     work_dir=work_dir,
                     data=data,
                     output_dir=output_dir,
+                    compat_profile=compat_profile,
                     dry_run=dry_run,
                     follow=follow,
                     uv_no_sync=uv_no_sync,
                     overrides=tuple(override or ()),
+                    target_examples=target_examples,
+                    sync_scheduler_to_max_steps=sync_scheduler_to_max_steps,
+                    pack_function=pack_function,
+                    loss_mask=loss_mask,
+                    model_attn=model_attn,
+                    renderer_mode=renderer_mode,
+                    tool_defs_mode=tool_defs_mode,
+                    chat_template_kwargs=tuple(chat_template_kwarg or ()),
+                    message_tail_truncation=message_tail_truncation,
+                    allow_unsafe_stack_flash_attn=allow_unsafe_stack_flash_attn,
                     force=force,
                     cwd=prime_rl_dir,
                     publish_model=publish_model,

@@ -21,18 +21,17 @@ def _write_rollout(
     *,
     reward: float = 1.0,
     exchanges: list[dict] | None = None,
+    result_overrides: dict | None = None,
 ) -> None:
     rollout_dir.mkdir(parents=True)
-    (rollout_dir / "result.json").write_text(
-        json.dumps(
-            {
-                "task_name": "demo-task",
-                "agent": "openhands",
-                "rewards": {"reward": reward},
-                "agent_result": {"total_tokens": 123, "n_tool_calls": 1},
-            }
-        )
-    )
+    result = {
+        "task_name": "demo-task",
+        "agent": "openhands",
+        "rewards": {"reward": reward},
+        "agent_result": {"total_tokens": 123, "n_tool_calls": 1},
+    }
+    result.update(result_overrides or {})
+    (rollout_dir / "result.json").write_text(json.dumps(result))
     traj = rollout_dir / "trajectory"
     traj.mkdir()
     records = (
@@ -124,7 +123,7 @@ def test_convert_rollout_mode_uses_final_successful_exchange(tmp_path: Path) -> 
     assert row["source"] == "benchflow-llm-trajectory"
     assert row["reward"] == 1.0
     assert row["tool_defs"][0]["function"]["name"] == "bash"
-    assert row["messages"][0] == {"role": "system", "content": "You are an agent."}
+    assert row["messages"][0] == {"role": "user", "content": "List files."}
     assert any(message.get("role") == "tool" for message in row["messages"])
     assert row["messages"][-1] == {"role": "assistant", "content": "Done."}
 
@@ -206,8 +205,7 @@ def test_skipped_provider_error_counts_rollouts_not_exchanges(tmp_path: Path) ->
 
 
 def test_consecutive_leading_system_messages_not_dropped(tmp_path: Path) -> None:
-    """Guards #828 greptile P2: a row that starts with two system messages must
-    remap the second to 'user' instead of being silently dropped as invalid."""
+    """A valid row with leading system messages must still export cleanly."""
     exchange = _exchange(final=True)
     exchange["request"]["body"]["messages"] = [
         {"role": "system", "content": "Primary system prompt."},
@@ -221,8 +219,8 @@ def test_consecutive_leading_system_messages_not_dropped(tmp_path: Path) -> None
     assert stats.rows_written == 1
     assert stats.skipped_invalid == 0
     roles = [m["role"] for m in rows[0]["messages"]]
-    assert roles[0] == "system"
-    assert roles[1] == "user"  # second leading system remapped
+    assert roles[0] == "user"
+    assert "system" not in roles
 
 
 def test_exchange_mode_writes_one_row_per_successful_exchange(tmp_path: Path) -> None:
@@ -251,6 +249,19 @@ def test_convert_filters_by_min_reward(tmp_path: Path) -> None:
     assert stats.skipped_reward == 1
 
 
+def test_convert_skips_terminal_errored_rollouts(tmp_path: Path) -> None:
+    _write_rollout(
+        tmp_path / "job" / "timeout",
+        result_overrides={"error": "Agent prompt exceeded wall-clock budget 600s"},
+    )
+
+    rows, stats = convert_benchflow_rollouts_to_prime_sft_rows(tmp_path / "job")
+
+    assert rows == []
+    assert stats.rows_written == 0
+    assert stats.skipped_terminal_error == 1
+
+
 def test_export_and_validate_prime_sft_jsonl(tmp_path: Path) -> None:
     """Guards this PR's end-to-end JSONL write and validation path."""
     _write_rollout(tmp_path / "job" / "rollout-1")
@@ -271,6 +282,95 @@ def test_export_and_validate_prime_sft_jsonl(tmp_path: Path) -> None:
         "rows_with_tool_calls": 1,
     }
     assert json.loads(manifest.read_text())["rows_written"] == 1
+
+
+def test_export_redacts_malformed_tool_call_arguments_before_serializing(
+    tmp_path: Path,
+) -> None:
+    """Nested tool-call arguments are JSON strings; redact before encoding them."""
+    exchange = _exchange(final=False)
+    exchange["response"]["body"]["choices"][0]["message"] = {
+        "role": "assistant",
+        "content": "Let me request a token.",
+        "tool_calls": [
+            {
+                "id": "call_token",
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "arguments": (
+                        '{"command": "curl -d \\"password=sk-abc1234567890def"'
+                        ' | jq .", "summary": "request token"}'
+                    ),
+                },
+            }
+        ],
+    }
+    _write_rollout(tmp_path / "job" / "rollout-1", exchanges=[exchange])
+    out = tmp_path / "train.jsonl"
+
+    export_prime_sft_jsonl(tmp_path / "job", out, expected_rows=1)
+
+    assert validate_prime_sft_jsonl(out, expected_rows=1) == {
+        "ok": True,
+        "rows": 1,
+        "rows_with_tool_calls": 1,
+    }
+    row = json.loads(out.read_text())
+    arguments = row["messages"][-1]["tool_calls"][0]["function"]["arguments"]
+    parsed_arguments = json.loads(arguments)
+    assert parsed_arguments == {
+        "_malformed_json_arguments": (
+            '{"command": "curl -d \\"password=***REDACTED***"'
+            ' | jq .", "summary": "request token"}'
+        )
+    }
+
+
+def test_export_keeps_already_redacted_tool_call_arguments_valid(
+    tmp_path: Path,
+) -> None:
+    """A later request can replay already-redacted malformed arguments."""
+    exchange = _exchange(final=False)
+    exchange["request"]["body"]["messages"] = [
+        {"role": "user", "content": "Request a token."},
+        {
+            "role": "assistant",
+            "content": "Let me request a token.",
+            "tool_calls": [
+                {
+                    "id": "call_token",
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "arguments": json.dumps(
+                            {
+                                "_malformed_json_arguments": (
+                                    '{"command": "curl -d '
+                                    '\\"password=***REDACTED***" | jq ."}'
+                                )
+                            }
+                        ),
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_token", "content": "ok"},
+    ]
+    _write_rollout(tmp_path / "job" / "rollout-1", exchanges=[exchange])
+    out = tmp_path / "train.jsonl"
+
+    export_prime_sft_jsonl(tmp_path / "job", out, expected_rows=1)
+
+    assert validate_prime_sft_jsonl(out, expected_rows=1) == {
+        "ok": True,
+        "rows": 1,
+        "rows_with_tool_calls": 1,
+    }
+    row = json.loads(out.read_text())
+    arguments = row["messages"][1]["tool_calls"][0]["function"]["arguments"]
+    parsed_arguments = json.loads(arguments)
+    assert "_malformed_json_arguments" in parsed_arguments
 
 
 def test_validate_rejects_banned_message_keys(tmp_path: Path) -> None:
@@ -404,12 +504,190 @@ def test_export_accepts_existing_prime_sft_jsonl_input(tmp_path: Path) -> None:
     assert stats.rollouts_seen == 2
     assert stats.rows_written == 1
     assert stats.skipped_reward == 1
+    row = json.loads(out.read_text())
+    assert "messages" in row
+    assert "prompt" not in row
+    assert "completion" not in row
     assert validate_prime_sft_jsonl(out, expected_rows=1) == {
         "ok": True,
         "rows": 1,
         "rows_with_tool_calls": 1,
     }
     assert json.loads(manifest.read_text())["sources"] == [str(source)]
+
+
+def test_export_windows_benchflow_results_rows_for_prime_rl_8k(
+    tmp_path: Path,
+) -> None:
+    """BenchFlow results rows must not strand assistant tokens past 8k context."""
+    source = tmp_path / "results.jsonl"
+    out = tmp_path / "prime-sft.jsonl"
+    source.write_text(
+        json.dumps(
+            {
+                "prompt": [
+                    {"role": "system", "content": "system prompt\n" * 5000},
+                    {"role": "user", "content": "Solve the current task."},
+                ],
+                "completion": [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "terminal",
+                                    "arguments": "{}",
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_1",
+                        "content": "ok",
+                    },
+                    {"role": "assistant", "content": "Done."},
+                ],
+                "tool_defs": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "terminal",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+                "info": {"source": "benchflow", "task_id": "task-a"},
+                "reward": 1.0,
+                "trajectory": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    stats = export_prime_sft_jsonl(source, out, expected_rows=1)
+
+    assert stats.rows_written == 1
+    row = json.loads(out.read_text())
+    assert row["messages"][0] == {"role": "user", "content": "Solve the current task."}
+    assert all(message.get("role") != "system" for message in row["messages"])
+    assert row["messages"][1]["role"] == "assistant"
+    assert validate_prime_sft_jsonl(out, expected_rows=1) == {
+        "ok": True,
+        "rows": 1,
+        "rows_with_tool_calls": 1,
+    }
+
+
+def test_export_skips_benchflow_results_rows_marked_not_training_ready(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "results.jsonl"
+    out = tmp_path / "prime-sft.jsonl"
+    source.write_text(
+        json.dumps(
+            {
+                "prompt": [{"role": "user", "content": "do it"}],
+                "completion": [{"role": "assistant", "content": "done"}],
+                "info": {
+                    "source": "benchflow",
+                    "training_ready": False,
+                    "training_ready_reason": "agent_error",
+                },
+                "error": {
+                    "error": "agent_error",
+                    "error_chain_str": "timeout",
+                },
+                "reward": 0.7,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    stats = export_prime_sft_jsonl(source, out, expected_rows=0)
+
+    assert out.read_text() == ""
+    assert stats.rows_written == 0
+    assert stats.skipped_terminal_error == 1
+
+
+def test_export_repairs_legacy_results_tool_call_ids(tmp_path: Path) -> None:
+    """Guards historical BenchFlow results rows whose assistant/tool ids drifted."""
+    source = tmp_path / "results.jsonl"
+    out = tmp_path / "prime-sft.jsonl"
+    manifest = tmp_path / "manifest.json"
+    source.write_text(
+        json.dumps(
+            {
+                "prompt": [{"role": "user", "content": "Inspect the app."}],
+                "completion": [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "fc_legacy_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "terminal",
+                                    "arguments": "{}",
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_runtime_1",
+                        "content": "first chunk",
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_runtime_1",
+                        "content": "second chunk",
+                    },
+                    {"role": "assistant", "content": "Done."},
+                ],
+                "tool_defs": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "terminal",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+                "reward": 1.0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    stats = export_prime_sft_jsonl(source, out, expected_rows=1, manifest=manifest)
+
+    row = json.loads(out.read_text())
+    assert stats.tool_call_ids_rewritten == 1
+    assert stats.tool_messages_merged == 1
+    assert "trajectory" not in row
+    assert row["messages"][1]["tool_calls"][0]["id"] == "call_runtime_1"
+    assert row["messages"][2] == {
+        "role": "tool",
+        "tool_call_id": "call_runtime_1",
+        "content": "first chunk\nsecond chunk",
+    }
+    assert validate_prime_sft_jsonl(out, expected_rows=1) == {
+        "ok": True,
+        "rows": 1,
+        "rows_with_tool_calls": 1,
+    }
+    manifest_payload = json.loads(manifest.read_text())
+    assert manifest_payload["tool_call_ids_rewritten"] == 1
+    assert manifest_payload["tool_messages_merged"] == 1
 
 
 def test_validate_rejects_tool_calls_without_tool_defs(tmp_path: Path) -> None:
@@ -694,3 +972,68 @@ def test_convert_openhands_responses_shape_preserves_tool_calls(tmp_path: Path) 
         "content": "File created.",
     }
     assert row["messages"][-1] == {"role": "assistant", "content": "Done."}
+
+
+def test_convert_succeeds_when_trajectory_written_via_to_jsonl_with_secrets(
+    tmp_path: Path,
+) -> None:
+    """PR #849 end-to-end regression: a trajectory whose content carries a secret
+    next to a backslash escape must be written as valid JSON by
+    ``Trajectory.to_jsonl`` and convert cleanly to a prime-sft row. Before the
+    redactor was moved ahead of serialization, the post-``json.dumps`` regex split
+    the escape, producing an unparseable ``llm_trajectory.jsonl`` and a hard
+    ``Invalid \\escape`` failure.
+    """
+    from benchflow.trajectories.types import (
+        LLMExchange,
+        LLMRequest,
+        LLMResponse,
+        Trajectory,
+    )
+
+    secret = "sk-abc1234567defghijklmnop987654"
+    code = (
+        'token = form.get("token")\n'
+        "    if not token:\n"
+        f'        raise HTTPException(400, "invalid")  # {secret}\n'
+    )
+    messages = [
+        {"role": "system", "content": [{"type": "text", "text": "agent"}]},
+        {"role": "user", "content": "Edit the revoke handler."},
+    ]
+    traj = Trajectory(
+        session_id="s",
+        exchanges=[
+            LLMExchange(
+                request=LLMRequest(
+                    body={"model": "m", "messages": messages, "tools": []}
+                ),
+                response=LLMResponse(
+                    status_code=200,
+                    body={
+                        "choices": [{"message": {"role": "assistant", "content": code}}]
+                    },
+                ),
+            )
+        ],
+    )
+
+    rollout = tmp_path / "job" / "rollout-1"
+    (rollout / "trajectory").mkdir(parents=True)
+    (rollout / "result.json").write_text(
+        json.dumps({"task_name": "t", "agent": "openhands", "rewards": {"reward": 1.0}})
+    )
+    traj_path = rollout / "trajectory" / "llm_trajectory.jsonl"
+    traj_path.write_text(traj.to_jsonl(redact_keys=True) + "\n", encoding="utf-8")
+
+    # the written trajectory parses (the fix) ...
+    for line in traj_path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            json.loads(line)
+    # ... and converts to one valid prime-sft row with the secret redacted.
+    rows, stats = convert_benchflow_rollouts_to_prime_sft_rows(
+        tmp_path / "job", min_reward=1.0
+    )
+    assert stats.rows_written == 1
+    assert stats.skipped_invalid == 0
+    assert secret not in json.dumps(rows[0])
