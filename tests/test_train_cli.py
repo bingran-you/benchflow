@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -18,14 +21,36 @@ class _FakeTailTokenizer:
     eos_token_id = 0
 
     def apply_chat_template(self, messages: list[dict[str, Any]], **kwargs: Any):
-        del kwargs
+        if kwargs.get("tokenize") is False:
+            return "".join(
+                str(message.get("content") or "")
+                + ("T" * (4 * len(message.get("tool_calls") or [])))
+                for message in messages
+            )
         length = 0
         for message in messages:
             content = message.get("content")
             if isinstance(content, str):
                 length += len(content)
+            prefix_ws = message.get("prefix_ws")
+            if isinstance(prefix_ws, str):
+                length += len(prefix_ws)
+            suffix_ws = message.get("suffix_ws")
+            if isinstance(suffix_ws, str):
+                length += len(suffix_ws)
             length += 4 * len(message.get("tool_calls") or [])
         return [1] * length + [self.eos_token_id]
+
+    def __call__(self, text: str, **kwargs: Any) -> dict[str, list[int]]:
+        del kwargs
+        return {"input_ids": [ord(char) for char in text]}
+
+    def decode(self, token_ids: list[int], **kwargs: Any) -> str:
+        del kwargs
+        return "".join(
+            "<eos>" if token_id == self.eos_token_id else chr(token_id)
+            for token_id in token_ids
+        )
 
 
 def _write_rollout(rollout_dir: Path) -> None:
@@ -177,6 +202,70 @@ def test_train_convert_accepts_results_jsonl_cli(tmp_path: Path) -> None:
     assert "Converted 1 row" in result.output
     result = runner.invoke(app, ["train", "validate", str(out), "--expected-rows", "1"])
     assert result.exit_code == 0, result.output
+
+
+def test_train_convert_no_redact_preserves_tool_argument_tokens(tmp_path: Path) -> None:
+    """Private SFT conversion should not mutate valid tool-call argument strings."""
+    source = tmp_path / "results.jsonl"
+    raw_arguments = json.dumps(
+        {
+            "command": "headers={'Authorization': f'Bearer {token}'}",
+            "summary": "use runtime token",
+        }
+    )
+    source.write_text(
+        json.dumps(
+            {
+                "prompt": [{"role": "user", "content": "do it"}],
+                "completion": [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "terminal",
+                                    "arguments": raw_arguments,
+                                },
+                            }
+                        ],
+                    }
+                ],
+                "tool_defs": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "terminal",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+                "reward": 1.0,
+            }
+        )
+        + "\n"
+    )
+    out = tmp_path / "prime-sft.jsonl"
+
+    result = runner.invoke(
+        app,
+        [
+            "train",
+            "convert",
+            str(source),
+            "--out",
+            str(out),
+            "--expected-rows",
+            "1",
+            "--no-redact",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    row = json.loads(out.read_text())
+    assert row["messages"][1]["tool_calls"][0]["function"]["arguments"] == raw_arguments
 
 
 def test_train_convert_sanitizes_malformed_tool_call_arguments(
@@ -609,6 +698,8 @@ def test_train_run_sft_prime_rl_packages_local_jsonl_data(
         "message_tail_max_area": None,
         "message_tail_max_tokens_before": None,
         "message_tail_max_tokens_after": None,
+        "custom_trainer_pretokenized_rows": None,
+        "custom_trainer_pretokenized_trainable_tokens": None,
         "validation": {"ok": True, "rows": 1, "rows_with_tool_calls": 1},
     }
 
@@ -721,6 +812,7 @@ def test_train_run_sft_prime_rl_target_examples_derives_exposure(
     assert manifest["extra"]["prime_rl_sft_exposure_plan"] == {
         "data_batch_size": 8,
         "derived_max_steps": 38,
+        "effective_train_examples": 304,
         "generated_overrides": [
             "max_steps=38",
             "scheduler.decay_steps=38",
@@ -730,8 +822,11 @@ def test_train_run_sft_prime_rl_target_examples_derives_exposure(
         "model_attn": None,
         "pack_function": "stack",
         "renderer_mode": None,
+        "sync_ckpt_to_max_steps": False,
         "sync_scheduler_to_max_steps": True,
         "target_examples": 300,
+        "target_micro_steps": None,
+        "unapplied_micro_steps": None,
     }
 
 
@@ -787,6 +882,77 @@ def test_train_run_sft_prime_rl_target_examples_respects_batch_override(
     )
 
 
+def test_train_run_sft_prime_rl_target_micro_steps_drops_partial_accumulation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Custom-trainer max_steps counted micro-batches, not optimizer updates."""
+    import benchflow.training.backends.prime_rl as prime_rl
+
+    captured: dict[str, Any] = {}
+
+    class FakeProcess:
+        def __init__(self, argv: list[str], **kwargs: Any) -> None:
+            del kwargs
+            captured["argv"] = argv
+            self.stdout = io.StringIO("")
+            self.stderr = io.StringIO("")
+
+        def wait(self) -> int:
+            return 0
+
+    config = tmp_path / "sft.toml"
+    config.write_text(
+        "max_steps = 300\n[data]\nbatch_size = 8\n[scheduler]\ndecay_steps = 300\n",
+        encoding="utf-8",
+    )
+    work_dir = tmp_path / "train-run"
+
+    monkeypatch.setattr(prime_rl.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(prime_rl.subprocess, "Popen", FakeProcess)
+
+    result = runner.invoke(
+        app,
+        [
+            "train",
+            "run",
+            "sft",
+            "--config",
+            str(config),
+            "--work-dir",
+            str(work_dir),
+            "--target-micro-steps",
+            "300",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["argv"][-4:] == [
+        "--max_steps",
+        "37",
+        "--scheduler.decay_steps",
+        "37",
+    ]
+    manifest = json.loads((work_dir / "train-run.json").read_text())
+    assert manifest["extra"]["prime_rl_sft_exposure_plan"] == {
+        "data_batch_size": 8,
+        "derived_max_steps": 37,
+        "effective_train_examples": 296,
+        "generated_overrides": [
+            "max_steps=37",
+            "scheduler.decay_steps=37",
+        ],
+        "loss_mask": None,
+        "model_attn": None,
+        "pack_function": None,
+        "renderer_mode": None,
+        "sync_ckpt_to_max_steps": False,
+        "sync_scheduler_to_max_steps": True,
+        "target_examples": None,
+        "target_micro_steps": 300,
+        "unapplied_micro_steps": 4,
+    }
+
+
 def test_train_run_sft_prime_rl_records_reproduction_semantics(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -797,8 +963,8 @@ def test_train_run_sft_prime_rl_records_reproduction_semantics(
 
     class FakeProcess:
         def __init__(self, argv: list[str], **kwargs: Any) -> None:
-            del kwargs
             captured["argv"] = argv
+            captured["env"] = kwargs.get("env")
             self.stdout = io.StringIO("trainer ok\n")
             self.stderr = io.StringIO("")
 
@@ -872,6 +1038,7 @@ def test_train_run_sft_prime_rl_records_reproduction_semantics(
     assert manifest["extra"]["prime_rl_sft_exposure_plan"] == {
         "data_batch_size": 8,
         "derived_max_steps": 38,
+        "effective_train_examples": 304,
         "generated_overrides": [
             "max_steps=38",
             "scheduler.decay_steps=38",
@@ -886,9 +1053,100 @@ def test_train_run_sft_prime_rl_records_reproduction_semantics(
         "model_attn": "sdpa",
         "pack_function": "stack",
         "renderer_mode": None,
+        "sync_ckpt_to_max_steps": False,
         "sync_scheduler_to_max_steps": True,
         "target_examples": 300,
+        "target_micro_steps": None,
+        "unapplied_micro_steps": None,
     }
+
+
+def test_train_run_sft_prime_rl_sample_mean_requires_stack(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Sample-mean loss is only valid when Prime-RL preserves row boundaries."""
+    import benchflow.training.backends.prime_rl as prime_rl
+
+    config = tmp_path / "sft.toml"
+    config.write_text(
+        "\n".join(
+            [
+                "max_steps = 1",
+                "[data]",
+                "batch_size = 8",
+                'pack_function = "cat"',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    work_dir = tmp_path / "train-run"
+
+    monkeypatch.setattr(prime_rl.shutil, "which", lambda name: "/usr/bin/uv")
+
+    result = runner.invoke(
+        app,
+        [
+            "train",
+            "run",
+            "sft",
+            "--config",
+            str(config),
+            "--work-dir",
+            str(work_dir),
+            "--loss-normalization",
+            "sample_mean",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "sample_mean requires data.pack_function=stack" in result.output
+
+
+def test_train_run_sft_prime_rl_mobile300_requires_sample_mean(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The Mobile300 profile refuses native token-weighted Prime-RL loss."""
+    import benchflow.training.backends.prime_rl as prime_rl
+
+    config = tmp_path / "sft.toml"
+    config.write_text(
+        "\n".join(
+            [
+                "max_steps = 300",
+                "[model]",
+                'name = "Qwen/Qwen3.5-9B"',
+                "[data]",
+                "batch_size = 8",
+                'pack_function = "stack"',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    work_dir = tmp_path / "train-run"
+
+    monkeypatch.setattr(prime_rl.shutil, "which", lambda name: "/usr/bin/uv")
+
+    result = runner.invoke(
+        app,
+        [
+            "train",
+            "run",
+            "sft",
+            "--config",
+            str(config),
+            "--work-dir",
+            str(work_dir),
+            "--compat-profile",
+            "env0-mobile300-pr828",
+            "--loss-normalization",
+            "token_mean",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "requires --loss-normalization sample_mean" in result.output
 
 
 def test_train_run_sft_prime_rl_mobile300_compat_profile(
@@ -901,8 +1159,8 @@ def test_train_run_sft_prime_rl_mobile300_compat_profile(
 
     class FakeProcess:
         def __init__(self, argv: list[str], **kwargs: Any) -> None:
-            del kwargs
             captured["argv"] = argv
+            captured["env"] = kwargs.get("env")
             self.stdout = io.StringIO("trainer ok\n")
             self.stderr = io.StringIO("")
 
@@ -988,11 +1246,19 @@ def test_train_run_sft_prime_rl_mobile300_compat_profile(
 
     assert result.exit_code == 0, result.output
     argv = captured["argv"]
-    assert argv[-18:] == [
+    assert captured["env"]["BENCHFLOW_PRIME_RL_SAMPLE_MEAN_LOSS"] == "1"
+    assert captured["env"]["BENCHFLOW_PRIME_RL_PRETOKENIZED_SFT_DATA"] == "1"
+    assert captured["env"]["BENCHFLOW_PRIME_RL_STUB_FLASH_ATTN"] == "1"
+    assert "--tokenizer.chat_template" not in argv
+    assert argv[-22:] == [
         "--max_steps",
-        "38",
+        "37",
         "--scheduler.decay_steps",
-        "38",
+        "37",
+        "--ckpt.interval",
+        "37",
+        "--ckpt.keep_interval",
+        "37",
         "--data.pack_function",
         "stack",
         "--data.loss_mask.system",
@@ -1013,34 +1279,287 @@ def test_train_run_sft_prime_rl_mobile300_compat_profile(
     staged_row = json.loads((staged_dir / "train.jsonl").read_text())
     assert "tool_defs" not in staged_row
     assert "tools" not in staged_row
-    assert staged_row["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "chat_template_kwargs" not in staged_row
+    assert "messages" not in staged_row
+    assert staged_row["benchflow_custom_trainer_pretokenized"] == {
+        "original_token_count": 12,
+        "staged_token_count": 12,
+        "trainable_token_count": 11,
+    }
+    assert staged_row["benchflow_input_ids"] == [
+        ord(char) for char in "finishTTTTok"[:-1]
+    ]
+    assert staged_row["benchflow_target_ids"] == [
+        ord(char) for char in "finishTTTTok"[1:]
+    ]
+    assert staged_row["benchflow_loss_mask"] == [True] * 11
+    assert staged_row["benchflow_position_ids"] == list(range(11))
 
     manifest = json.loads((work_dir / "train-run.json").read_text())
+    command_text = (work_dir / "command.txt").read_text()
+    assert "BENCHFLOW_PRIME_RL_SAMPLE_MEAN_LOSS=1" in command_text
+    assert "BENCHFLOW_PRIME_RL_PRETOKENIZED_SFT_DATA=1" in command_text
+    assert "BENCHFLOW_PRIME_RL_STUB_FLASH_ATTN=1" in command_text
+    assert "PYTHONPATH=" in command_text
+    shim = manifest["extra"]["prime_rl_sft_shim"]
+    shim_dir = Path(shim["shim_dir"])
+    assert captured["env"]["PYTHONPATH"].split(os.pathsep)[0] == str(shim_dir)
+    assert shim["env"]["BENCHFLOW_PRIME_RL_STUB_FLASH_ATTN"] == "1"
+    assert "model.attn=sdpa" in shim["guards"]
+    sitecustomize_text = Path(shim["sitecustomize"]).read_text(encoding="utf-8")
+    assert sitecustomize_text.startswith(
+        '"""BenchFlow Prime-RL SFT compatibility shim.'
+    )
+    assert "if not torch.any(valid_sample_mask):" in sitecustomize_text
+    assert "if not torch.all(valid_sample_mask):" not in sitecustomize_text
+    assert "_flash_attn_varlen_forward" in sitecustomize_text
+    assert "flash-attn import stub enabled for SDPA" in sitecustomize_text
+    assert "def benchflow_setup_dataloader" in sitecustomize_text
+    assert shim["name"] == "prime_rl_sft_compatibility"
+    assert (
+        "pretokenized rows bypass Prime-RL stack/cat packing and train one original "
+        "row per micro-batch"
+    ) in shim["guards"]
     assert manifest["extra"]["prime_rl_sft_compat_profile"]["name"] == (
         "env0-mobile300-pr828"
     )
     assert manifest["extra"]["prime_rl_sft_compat_profile"]["resolved_settings"] == {
-        "target_examples": 300,
+        "target_examples": None,
+        "target_micro_steps": 300,
         "sync_scheduler_to_max_steps": True,
+        "sync_ckpt_to_max_steps": True,
         "pack_function": "stack",
         "loss_mask": "all",
+        "loss_normalization": "sample_mean",
         "model_attn": "sdpa",
         "renderer_mode": "none",
         "tool_defs_mode": "omit",
-        "chat_template_kwargs": {"enable_thinking": False},
-        "message_tail_truncation": "keep-first-user",
+        "chat_template_kwargs": {},
+        "message_tail_truncation": "custom-trainer-pretokenized",
     }
+    assert (
+        manifest["extra"]["prime_rl_sft_exposure_plan"]["effective_train_examples"]
+        == 296
+    )
+    assert manifest["extra"]["prime_rl_sft_exposure_plan"]["unapplied_micro_steps"] == 4
+    assert manifest["extra"]["prime_rl_sft_exposure_plan"]["generated_overrides"][
+        :4
+    ] == [
+        "max_steps=37",
+        "scheduler.decay_steps=37",
+        "ckpt.interval=37",
+        "ckpt.keep_interval=37",
+    ]
     assert manifest["extra"]["prime_rl_sft_dataset"]["tool_defs_mode"] == "omit"
     assert manifest["extra"]["prime_rl_sft_dataset"]["tool_defs_removed_rows"] == 1
-    assert manifest["extra"]["prime_rl_sft_dataset"]["chat_template_kwargs"] == {
-        "enable_thinking": False
-    }
-    assert manifest["extra"]["prime_rl_sft_dataset"]["chat_template_kwargs_rows"] == 1
+    assert manifest["extra"]["prime_rl_sft_dataset"]["chat_template_kwargs"] is None
+    assert (
+        manifest["extra"]["prime_rl_sft_dataset"]["chat_template_kwargs_rows"] is None
+    )
     assert manifest["extra"]["prime_rl_sft_dataset"]["message_tail_truncation"] == (
-        "keep-first-user"
+        "custom-trainer-pretokenized"
     )
     assert manifest["extra"]["prime_rl_sft_dataset"]["message_tail_truncated_rows"] == 0
     assert manifest["extra"]["prime_rl_sft_dataset"]["message_tail_max_area"] == 128
+    assert (
+        manifest["extra"]["prime_rl_sft_dataset"]["custom_trainer_pretokenized_rows"]
+        == 1
+    )
+    assert (
+        manifest["extra"]["prime_rl_sft_dataset"][
+            "custom_trainer_pretokenized_trainable_tokens"
+        ]
+        == 11
+    )
+
+
+def test_prime_rl_sft_flash_attn_stub_imports_and_fails_closed(tmp_path: Path) -> None:
+    """The SDPA shim satisfies import-time ring_flash_attn symbols only."""
+    import benchflow.training.backends.prime_rl as prime_rl
+
+    fake_transformers_utils = tmp_path / "fake" / "transformers" / "utils"
+    fake_transformers_utils.mkdir(parents=True)
+    (fake_transformers_utils.parent / "__init__.py").write_text("", encoding="utf-8")
+    (fake_transformers_utils / "__init__.py").write_text("", encoding="utf-8")
+    (fake_transformers_utils / "import_utils.py").write_text(
+        "PACKAGE_DISTRIBUTION_MAPPING = {}\n",
+        encoding="utf-8",
+    )
+
+    plan = prime_rl._write_prime_rl_sft_compat_shim(
+        tmp_path,
+        sample_mean=False,
+        pretokenized_data=False,
+        stub_flash_attn=True,
+    )
+    env = os.environ.copy()
+    env.update(plan.env)
+    env["PYTHONPATH"] = os.pathsep.join(
+        (plan.env["PYTHONPATH"], str(tmp_path / "fake"))
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "\n".join(
+                [
+                    "from flash_attn.flash_attn_interface import _flash_attn_forward",
+                    (
+                        "from transformers.utils.import_utils import "
+                        "PACKAGE_DISTRIBUTION_MAPPING"
+                    ),
+                    "print(PACKAGE_DISTRIBUTION_MAPPING['flash_attn'])",
+                    "try:",
+                    "    _flash_attn_forward()",
+                    "except RuntimeError as exc:",
+                    "    print(str(exc))",
+                    "else:",
+                    "    raise SystemExit('expected RuntimeError')",
+                ]
+            ),
+        ],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "flash-attn import stub enabled for SDPA" in completed.stderr
+    assert "['flash-attn']" in completed.stdout
+    assert "model.attn=sdpa" in completed.stdout
+    assert "called unexpectedly" in completed.stdout
+
+
+def test_prime_rl_pretokenized_shim_uses_rowwise_dataloader(tmp_path: Path) -> None:
+    """Pretokenized rows bypass Prime-RL packers so exposure matches the old trainer."""
+    import benchflow.training.backends.prime_rl as prime_rl
+
+    fake_sft = tmp_path / "fake" / "prime_rl" / "trainer" / "sft"
+    fake_sft.mkdir(parents=True)
+    for package_dir in [
+        fake_sft.parent.parent,
+        fake_sft.parent,
+        fake_sft,
+    ]:
+        (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (fake_sft / "data.py").write_text(
+        "\n".join(
+            [
+                "class SFTDataset:",
+                "    def _process(self, example):",
+                "        return {'native': True, 'example': example}",
+                "",
+                "class StatefulDataLoader:",
+                "    def __init__(self, dataset, batch_size, collate_fn):",
+                "        self.dataset = dataset",
+                "        self.batch_size = batch_size",
+                "        self.collate_fn = collate_fn",
+                "",
+                "def setup_dataloader(dataset, config):",
+                "    return ('native', dataset, config)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    plan = prime_rl._write_prime_rl_sft_compat_shim(
+        tmp_path,
+        sample_mean=False,
+        pretokenized_data=True,
+        stub_flash_attn=False,
+    )
+    env = os.environ.copy()
+    env.update(plan.env)
+    env["PYTHONPATH"] = os.pathsep.join(
+        (plan.env["PYTHONPATH"], str(tmp_path / "fake"))
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "\n".join(
+                [
+                    "import json",
+                    "import prime_rl.trainer.sft.data as data",
+                    "row = {",
+                    "    'benchflow_custom_trainer_pretokenized': True,",
+                    "    'benchflow_input_ids': [1, 2, 3],",
+                    "    'benchflow_target_ids': [2, 3, 4],",
+                    "    'benchflow_loss_mask': [True, False, True],",
+                    "    'benchflow_position_ids': [0, 1, 2],",
+                    "}",
+                    "processed = data.SFTDataset()._process(row)",
+                    "loader = data.setup_dataloader('dataset', 'config')",
+                    "native = data.SFTDataset()._process({'messages': []})",
+                    "print(json.dumps({",
+                    "    'processed': processed,",
+                    "    'loader_class': type(loader).__name__,",
+                    "    'loader_batch_size': loader.batch_size,",
+                    "    'loader_collate_callable': callable(loader.collate_fn),",
+                    "    'native': native,",
+                    "}, sort_keys=True))",
+                ]
+            ),
+        ],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "BenchFlow Prime-RL pretokenized SFT data shim enabled" in completed.stderr
+    payload = json.loads(completed.stdout)
+    assert payload == {
+        "loader_batch_size": 1,
+        "loader_class": "StatefulDataLoader",
+        "loader_collate_callable": True,
+        "native": {"example": {"messages": []}, "native": True},
+        "processed": {
+            "input_ids": [1, 2, 3],
+            "loss_mask": [True, False, True],
+            "position_ids": [0, 1, 2],
+            "target_ids": [2, 3, 4],
+        },
+    }
+
+
+def test_prime_rl_custom_trainer_pretokenized_row_masks_last_assistant_only() -> None:
+    """The compatibility row matches the old shifted-label custom trainer path."""
+    import benchflow.training.backends.prime_rl as prime_rl
+
+    assert (
+        prime_rl._normalize_message_tail_truncation("custom-trainer-token-suffix")
+        == "custom-trainer-pretokenized"
+    )
+
+    row, before, after, trainable_tokens = prime_rl._custom_trainer_pretokenized_row(
+        _FakeTailTokenizer(),
+        {
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "OK"},
+            ],
+            "label_last_assistant_only": True,
+            "reward": 1.0,
+        },
+        max_length=64,
+    )
+
+    assert before == 7
+    assert after == 7
+    assert trainable_tokens == 2
+    assert row["benchflow_input_ids"] == [ord(char) for char in "helloO"]
+    assert row["benchflow_target_ids"] == [ord(char) for char in "elloOK"]
+    assert row["benchflow_loss_mask"] == [False, False, False, False, True, True]
+    assert row["benchflow_position_ids"] == list(range(6))
+    assert row["benchflow_custom_trainer_pretokenized"] == {
+        "original_token_count": 7,
+        "staged_token_count": 7,
+        "trainable_token_count": 2,
+    }
 
 
 def test_train_run_sft_prime_rl_custom_trainer_compatibility_mode(

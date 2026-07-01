@@ -414,6 +414,14 @@ separate Prime-RL stdout/stderr logs under `<work-dir>/prime-rl/`. Secrets are
 not written to the manifest; only the names of recognized credential env vars
 that were present are recorded.
 
+For the Mobile300 PR828 reproduction, use `--compat-profile
+env0-mobile300-pr828`. That profile stages the historical custom-trainer
+pretokenized shifted-label rows, bypasses Prime-RL `stack`/`cat` packing for
+those staged rows so training sees one original trajectory per micro-batch, and
+enables `sample_mean` loss normalization through a run-local `sitecustomize.py`
+shim. The shim leaves Prime-RL package files untouched but fails closed if the
+Prime-RL SFT train loop or data module no longer exposes the expected hooks.
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--backend` | `prime-rl` | Training backend. Currently only `prime-rl` is supported |
@@ -427,10 +435,13 @@ that were present are recorded.
 | `--follow` | `false` | Stream trainer stdout while writing logs |
 | `--uv-no-sync` | `false` | Run Prime-RL as `uv run --no-sync sft ...`, useful after backend post-install steps such as `flash-attn` |
 | `--override` | — | Prime-RL override as `KEY=VALUE`; repeatable, emitted as `--KEY VALUE` |
-| `--target-examples` | — | Derive Prime-RL `max_steps` from target sample exposure and effective `data.batch_size` |
-| `--sync-scheduler-to-max-steps` / `--no-sync-scheduler-to-max-steps` | `true` | When `--target-examples` is set, also derive `scheduler.decay_steps` |
+| `--target-examples` | — | Derive Prime-RL `max_steps` from target sample exposure and effective `data.batch_size`, rounding up |
+| `--target-micro-steps` | — | Derive Prime-RL `max_steps` from custom-trainer batch-size-1 microsteps, dropping the final partial accumulation |
+| `--sync-scheduler-to-max-steps` / `--no-sync-scheduler-to-max-steps` | `true` | When `--target-examples` or `--target-micro-steps` is set, also derive `scheduler.decay_steps` |
+| `--sync-ckpt-to-max-steps` / `--no-sync-ckpt-to-max-steps` | `false` | When deriving `max_steps`, also derive `ckpt.interval` and `ckpt.keep_interval` |
 | `--pack-function` | — | First-class Prime-RL `data.pack_function` override: `cat` or `stack` |
 | `--loss-mask` | — | First-class Prime-RL `data.loss_mask` override: `assistant`, `all`, or comma-separated roles from `system,user,assistant,tool` |
+| `--loss-normalization` | — | Prime-RL SFT loss normalization. `token_mean` keeps native Prime-RL behavior; `sample_mean` launches a run-local compatibility shim that matches the historical custom trainer's per-row mean loss and requires `data.pack_function=stack` |
 | `--model-attn` | — | First-class Prime-RL `model.attn` override, e.g. `sdpa` |
 | `--renderer-mode` | — | Prime-RL renderer override. `none` emits `--renderer None`, making Prime-RL use tokenizer `apply_chat_template` tokenization |
 | `--tool-defs-mode` | `preserve` | For local JSONL or local dataset dirs, keep tool schemas (`preserve`) or remove `tool_defs`/`tools` from the temporary training copy (`omit`) |

@@ -45,9 +45,12 @@ class PrimeRlSftSpec:
     uv_no_sync: bool = False
     overrides: tuple[str, ...] = ()
     target_examples: int | None = None
+    target_micro_steps: int | None = None
     sync_scheduler_to_max_steps: bool = True
+    sync_ckpt_to_max_steps: bool = False
     pack_function: str | None = None
     loss_mask: str | None = None
+    loss_normalization: str | None = None
     model_attn: str | None = None
     renderer_mode: str | None = None
     tool_defs_mode: str = "preserve"
@@ -74,9 +77,13 @@ class PrimeRlSftResult:
 @dataclass(frozen=True)
 class PrimeRlSftExposurePlan:
     target_examples: int | None = None
+    target_micro_steps: int | None = None
     data_batch_size: int | None = None
     derived_max_steps: int | None = None
+    effective_train_examples: int | None = None
+    unapplied_micro_steps: int | None = None
     sync_scheduler_to_max_steps: bool = False
+    sync_ckpt_to_max_steps: bool = False
     pack_function: str | None = None
     loss_mask: str | None = None
     model_attn: str | None = None
@@ -86,9 +93,13 @@ class PrimeRlSftExposurePlan:
     def to_dict(self) -> dict[str, Any]:
         return {
             "target_examples": self.target_examples,
+            "target_micro_steps": self.target_micro_steps,
             "data_batch_size": self.data_batch_size,
             "derived_max_steps": self.derived_max_steps,
+            "effective_train_examples": self.effective_train_examples,
+            "unapplied_micro_steps": self.unapplied_micro_steps,
             "sync_scheduler_to_max_steps": self.sync_scheduler_to_max_steps,
+            "sync_ckpt_to_max_steps": self.sync_ckpt_to_max_steps,
             "pack_function": self.pack_function,
             "loss_mask": self.loss_mask,
             "model_attn": self.model_attn,
@@ -113,6 +124,8 @@ class PrimeRlSftDatasetPlan:
     message_tail_max_area: int | None = None
     message_tail_max_tokens_before: int | None = None
     message_tail_max_tokens_after: int | None = None
+    custom_trainer_pretokenized_rows: int | None = None
+    custom_trainer_pretokenized_trainable_tokens: int | None = None
     validation: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -131,7 +144,31 @@ class PrimeRlSftDatasetPlan:
             "message_tail_max_area": self.message_tail_max_area,
             "message_tail_max_tokens_before": self.message_tail_max_tokens_before,
             "message_tail_max_tokens_after": self.message_tail_max_tokens_after,
+            "custom_trainer_pretokenized_rows": (self.custom_trainer_pretokenized_rows),
+            "custom_trainer_pretokenized_trainable_tokens": (
+                self.custom_trainer_pretokenized_trainable_tokens
+            ),
             "validation": self.validation,
+        }
+
+
+@dataclass(frozen=True)
+class PrimeRlSftShimPlan:
+    name: str
+    description: str
+    shim_dir: str
+    sitecustomize: str
+    env: dict[str, str]
+    guards: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "shim_dir": self.shim_dir,
+            "sitecustomize": self.sitecustomize,
+            "env": dict(self.env),
+            "guards": list(self.guards),
         }
 
 
@@ -142,6 +179,13 @@ class PrimeRlSftLaunch:
 
 
 _MOBILE300_PROFILE = "env0-mobile300-pr828"
+_CUSTOM_TRAINER_TOKEN_SUFFIX_MODE = "custom-trainer-token-suffix"
+_CUSTOM_TRAINER_PRETOKENIZED_MODE = "custom-trainer-pretokenized"
+_TOKEN_MEAN_LOSS_NORMALIZATION = "token_mean"
+_SAMPLE_MEAN_LOSS_NORMALIZATION = "sample_mean"
+_SAMPLE_MEAN_SHIM_ENV = "BENCHFLOW_PRIME_RL_SAMPLE_MEAN_LOSS"
+_PRETOKENIZED_DATA_SHIM_ENV = "BENCHFLOW_PRIME_RL_PRETOKENIZED_SFT_DATA"
+_STUB_FLASH_ATTN_ENV = "BENCHFLOW_PRIME_RL_STUB_FLASH_ATTN"
 _COMPAT_PROFILE_ALIASES = {
     _MOBILE300_PROFILE: _MOBILE300_PROFILE,
     "env-0-mobile300-pr828": _MOBILE300_PROFILE,
@@ -263,6 +307,25 @@ def _loss_mask_overrides(raw: str) -> tuple[str, tuple[str, ...]]:
     )
 
 
+def _normalize_loss_normalization(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    value = raw.strip().lower().replace("-", "_")
+    aliases = {
+        "token": _TOKEN_MEAN_LOSS_NORMALIZATION,
+        "token_mean": _TOKEN_MEAN_LOSS_NORMALIZATION,
+        "token_weighted": _TOKEN_MEAN_LOSS_NORMALIZATION,
+        "sample": _SAMPLE_MEAN_LOSS_NORMALIZATION,
+        "sample_mean": _SAMPLE_MEAN_LOSS_NORMALIZATION,
+        "row": _SAMPLE_MEAN_LOSS_NORMALIZATION,
+        "row_mean": _SAMPLE_MEAN_LOSS_NORMALIZATION,
+    }
+    normalized = aliases.get(value)
+    if normalized is None:
+        raise ValueError("--loss-normalization must be 'token_mean' or 'sample_mean'")
+    return normalized
+
+
 def _resolve_effective_value(
     config: Mapping[str, Any], overrides: Mapping[str, str], key: str
 ) -> Any:
@@ -310,11 +373,17 @@ def _normalize_message_tail_truncation(raw: str) -> str:
         "keep-user": "keep-first-user",
         "first-user": "keep-first-user",
         "keep-user-suffix": "keep-first-user",
+        "token-suffix": _CUSTOM_TRAINER_PRETOKENIZED_MODE,
+        "rendered-token-suffix": _CUSTOM_TRAINER_PRETOKENIZED_MODE,
+        "custom-token-suffix": _CUSTOM_TRAINER_PRETOKENIZED_MODE,
+        "custom-trainer-suffix": _CUSTOM_TRAINER_PRETOKENIZED_MODE,
+        _CUSTOM_TRAINER_TOKEN_SUFFIX_MODE: _CUSTOM_TRAINER_PRETOKENIZED_MODE,
     }
     value = aliases.get(value, value)
-    if value not in {"off", "keep-first-user"}:
+    if value not in {"off", "keep-first-user", _CUSTOM_TRAINER_PRETOKENIZED_MODE}:
         raise ValueError(
-            "--message-tail-truncation must be either 'off' or 'keep-first-user'"
+            "--message-tail-truncation must be 'off', 'keep-first-user', or "
+            f"'{_CUSTOM_TRAINER_PRETOKENIZED_MODE}'"
         )
     return value
 
@@ -406,14 +475,35 @@ def _apply_compat_profile(spec: PrimeRlSftSpec) -> PrimeRlSftSpec:
         raise ValueError(
             f"--compat-profile {profile} requires --sync-scheduler-to-max-steps"
         )
+    if spec.target_examples is not None:
+        _profile_field(
+            spec.target_examples, 300, field="--target-examples", profile=profile
+        )
+    if spec.chat_template_kwargs:
+        raise ValueError(
+            f"--compat-profile {profile} stages pre-tokenized custom-trainer "
+            "samples and does not support --chat-template-kwarg"
+        )
+    loss_normalization = _normalize_loss_normalization(spec.loss_normalization)
+    if loss_normalization not in {None, _SAMPLE_MEAN_LOSS_NORMALIZATION}:
+        raise ValueError(
+            f"--compat-profile {profile} requires "
+            f"--loss-normalization {_SAMPLE_MEAN_LOSS_NORMALIZATION}; "
+            f"got {loss_normalization!r}"
+        )
     return replace(
         spec,
         compat_profile=profile,
-        target_examples=int(
+        target_examples=None,
+        target_micro_steps=int(
             _profile_field(
-                spec.target_examples, 300, field="--target-examples", profile=profile
+                spec.target_micro_steps,
+                300,
+                field="--target-micro-steps",
+                profile=profile,
             )
         ),
+        sync_ckpt_to_max_steps=True,
         pack_function=str(
             _profile_field(
                 spec.pack_function, "stack", field="--pack-function", profile=profile
@@ -422,6 +512,7 @@ def _apply_compat_profile(spec: PrimeRlSftSpec) -> PrimeRlSftSpec:
         loss_mask=str(
             _profile_field(spec.loss_mask, "all", field="--loss-mask", profile=profile)
         ),
+        loss_normalization=_SAMPLE_MEAN_LOSS_NORMALIZATION,
         model_attn=str(
             _profile_field(
                 spec.model_attn, "sdpa", field="--model-attn", profile=profile
@@ -433,12 +524,8 @@ def _apply_compat_profile(spec: PrimeRlSftSpec) -> PrimeRlSftSpec:
             )
         ),
         tool_defs_mode="omit",
-        chat_template_kwargs=_profile_chat_template_kwargs(
-            spec.chat_template_kwargs,
-            {"enable_thinking": False},
-            profile=profile,
-        ),
-        message_tail_truncation="keep-first-user",
+        chat_template_kwargs=(),
+        message_tail_truncation=_CUSTOM_TRAINER_PRETOKENIZED_MODE,
     )
 
 
@@ -479,6 +566,44 @@ def _validate_prime_rl_mode(
         )
 
 
+def _validate_prime_rl_loss_normalization(
+    spec: PrimeRlSftSpec,
+    config: Mapping[str, Any],
+    effective_overrides: Mapping[str, str],
+) -> None:
+    loss_normalization = _normalize_loss_normalization(spec.loss_normalization)
+    if loss_normalization in {None, _TOKEN_MEAN_LOSS_NORMALIZATION}:
+        return
+    pack_function = _string_or_none(
+        _resolve_effective_value(config, effective_overrides, "data.pack_function")
+    )
+    if pack_function != "stack":
+        raise ValueError(
+            "--loss-normalization sample_mean requires data.pack_function=stack "
+            "so each batch row remains one original training example"
+        )
+    model_cp = _resolve_effective_positive_int(
+        config, effective_overrides, "model.cp", default=1
+    )
+    if model_cp != 1:
+        raise ValueError(
+            "--loss-normalization sample_mean requires model.cp=1 because "
+            "sequence-sharded rows cannot be reduced to per-sample means by "
+            "the BenchFlow Prime-RL wrapper"
+        )
+    loss_impl = (
+        _string_or_none(
+            _resolve_effective_value(config, effective_overrides, "loss_impl")
+        )
+        or "torch"
+    )
+    if loss_impl in {"liger_fused", "quack_fused"}:
+        raise ValueError(
+            "--loss-normalization sample_mean does not support fused Prime-RL "
+            f"loss_impl={loss_impl!r}; use loss_impl=torch or loss_impl=liger"
+        )
+
+
 def _resolve_sample_max_area(
     config: Mapping[str, Any], overrides: Mapping[str, str]
 ) -> int:
@@ -497,12 +622,20 @@ def _build_generated_overrides(
     overrides = _override_map(spec.overrides)
     generated: list[str] = []
     target_examples: int | None = None
+    target_micro_steps: int | None = None
     data_batch_size: int | None = None
     derived_max_steps: int | None = None
+    effective_train_examples: int | None = None
+    unapplied_micro_steps: int | None = None
     pack_function: str | None = None
     loss_mask: str | None = None
     model_attn: str | None = None
     renderer_mode: str | None = None
+
+    if spec.target_examples is not None and spec.target_micro_steps is not None:
+        raise ValueError(
+            "--target-examples and --target-micro-steps cannot be combined"
+        )
 
     if spec.target_examples is not None:
         if "max_steps" in overrides:
@@ -514,6 +647,7 @@ def _build_generated_overrides(
         )
         data_batch_size = _resolve_data_batch_size(config, overrides)
         derived_max_steps = ceil(target_examples / data_batch_size)
+        effective_train_examples = derived_max_steps * data_batch_size
         generated.append(f"max_steps={derived_max_steps}")
         if spec.sync_scheduler_to_max_steps:
             if "scheduler.decay_steps" in overrides:
@@ -522,6 +656,52 @@ def _build_generated_overrides(
                     "--override scheduler.decay_steps=..."
                 )
             generated.append(f"scheduler.decay_steps={derived_max_steps}")
+
+    if spec.target_micro_steps is not None:
+        if "max_steps" in overrides:
+            raise ValueError(
+                "--target-micro-steps cannot be combined with --override max_steps=..."
+            )
+        target_micro_steps = _parse_positive_int(
+            spec.target_micro_steps, key="--target-micro-steps"
+        )
+        data_batch_size = _resolve_data_batch_size(config, overrides)
+        derived_max_steps = target_micro_steps // data_batch_size
+        if derived_max_steps <= 0:
+            raise ValueError(
+                "--target-micro-steps must cover at least one effective "
+                f"Prime-RL batch ({target_micro_steps} < {data_batch_size})"
+            )
+        effective_train_examples = derived_max_steps * data_batch_size
+        unapplied_micro_steps = target_micro_steps - effective_train_examples
+        generated.append(f"max_steps={derived_max_steps}")
+        if spec.sync_scheduler_to_max_steps:
+            if "scheduler.decay_steps" in overrides:
+                raise ValueError(
+                    "--sync-scheduler-to-max-steps cannot be combined with "
+                    "--override scheduler.decay_steps=..."
+                )
+            generated.append(f"scheduler.decay_steps={derived_max_steps}")
+
+    if spec.sync_ckpt_to_max_steps:
+        if derived_max_steps is None:
+            raise ValueError(
+                "--sync-ckpt-to-max-steps requires --target-examples or "
+                "--target-micro-steps"
+            )
+        ckpt_keys = ("ckpt.interval", "ckpt.keep_interval")
+        conflicting = sorted(key for key in ckpt_keys if key in overrides)
+        if conflicting:
+            raise ValueError(
+                "--sync-ckpt-to-max-steps cannot be combined with --override "
+                + ", ".join(f"{key}=..." for key in conflicting)
+            )
+        generated.extend(
+            [
+                f"ckpt.interval={derived_max_steps}",
+                f"ckpt.keep_interval={derived_max_steps}",
+            ]
+        )
 
     if spec.pack_function is not None:
         if spec.pack_function not in {"cat", "stack"}:
@@ -573,18 +753,23 @@ def _build_generated_overrides(
 
     effective_overrides = _override_map((*spec.overrides, *generated))
     _validate_prime_rl_mode(spec, config, effective_overrides)
+    _validate_prime_rl_loss_normalization(spec, config, effective_overrides)
 
     if not generated:
         return None
     return PrimeRlSftExposurePlan(
         target_examples=target_examples,
+        target_micro_steps=target_micro_steps,
         data_batch_size=data_batch_size,
         derived_max_steps=derived_max_steps,
+        effective_train_examples=effective_train_examples,
+        unapplied_micro_steps=unapplied_micro_steps,
         sync_scheduler_to_max_steps=(
             bool(spec.sync_scheduler_to_max_steps)
-            if target_examples is not None
+            if target_examples is not None or target_micro_steps is not None
             else False
         ),
+        sync_ckpt_to_max_steps=bool(spec.sync_ckpt_to_max_steps),
         pack_function=pack_function,
         loss_mask=loss_mask,
         model_attn=model_attn,
@@ -631,6 +816,449 @@ def _shell_quote(argv: list[str]) -> str:
     return " ".join(shlex.quote(arg) for arg in argv)
 
 
+def _shell_quote_env(env: Mapping[str, str]) -> str:
+    import shlex
+
+    return " ".join(f"{key}={shlex.quote(value)}" for key, value in env.items())
+
+
+_PRIME_RL_SFT_COMPAT_SITE_CUSTOMIZE = r'''
+"""BenchFlow Prime-RL SFT compatibility shim.
+
+This file is generated by BenchFlow for one trainer subprocess. It does not
+modify the installed Prime-RL package. It can patch loss reduction and make
+BenchFlow pre-tokenized tensor rows bypass Prime-RL message rendering.
+"""
+
+from __future__ import annotations
+
+import importlib.abc
+import importlib.machinery
+import os
+import sys
+import types
+
+_LOSS_ENV = "BENCHFLOW_PRIME_RL_SAMPLE_MEAN_LOSS"
+_DATA_ENV = "BENCHFLOW_PRIME_RL_PRETOKENIZED_SFT_DATA"
+_FLASH_ATTN_ENV = "BENCHFLOW_PRIME_RL_STUB_FLASH_ATTN"
+_LOSS_TARGET = "prime_rl.trainer.sft.train"
+_DATA_TARGET = "prime_rl.trainer.sft.data"
+_TRANSFORMERS_IMPORT_UTILS_TARGET = "transformers.utils.import_utils"
+
+_EXPECTED = """\
+        if config.model.lora is not None:
+            set_lora_num_tokens(torch.full((1,), input_ids.numel(), dtype=torch.int32, device="cuda"))
+
+        token_count = loss_mask.sum(dtype=torch.int64)
+
+        with maybe_activation_offloading(config.model.ac_offloading):
+            if config.loss_impl in ("liger_fused", "quack_fused"):
+                masked_target_ids = target_ids.clone()
+                masked_target_ids[~loss_mask] = FUSED_CE_IGNORE_INDEX
+                out = forward(model, input_ids, position_ids, labels=masked_target_ids)
+                loss_sum = out["loss"] * token_count
+            else:
+                out = forward(model, input_ids, position_ids)
+                logits = out["logits"]
+                B, L, V = logits.shape
+                token_loss = ce_loss(logits.view(-1, V), target_ids.view(-1)).view(B, L)
+                loss_sum = token_loss[loss_mask].sum()
+                del logits
+
+        del out
+        return loss_sum, token_count
+"""
+
+_REPLACEMENT = """\
+        if cp_enabled:
+            raise RuntimeError(
+                "BenchFlow sample-mean loss requires model.cp=1; context parallel "
+                "sequence shards cannot preserve original row means."
+            )
+
+        if config.model.lora is not None:
+            set_lora_num_tokens(torch.full((1,), input_ids.numel(), dtype=torch.int32, device="cuda"))
+
+        with maybe_activation_offloading(config.model.ac_offloading):
+            if config.loss_impl in ("liger_fused", "quack_fused"):
+                raise RuntimeError(
+                    "BenchFlow sample-mean loss supports loss_impl=torch or "
+                    "loss_impl=liger, not fused loss kernels."
+                )
+            out = forward(model, input_ids, position_ids)
+            logits = out["logits"]
+            B, L, V = logits.shape
+            token_loss = ce_loss(logits.view(-1, V), target_ids.view(-1)).view(B, L)
+            per_sample_token_count = loss_mask.sum(dim=1)
+            valid_sample_mask = per_sample_token_count > 0
+            if not torch.any(valid_sample_mask):
+                raise RuntimeError(
+                    "BenchFlow sample-mean loss received a batch with no "
+                    "trainable samples."
+                )
+            per_sample_loss_sum = (token_loss * loss_mask.to(token_loss.dtype)).sum(dim=1)
+            loss_sum = (
+                per_sample_loss_sum[valid_sample_mask]
+                / per_sample_token_count[valid_sample_mask].to(token_loss.dtype)
+            ).sum()
+            sample_count = valid_sample_mask.sum(dtype=torch.int64)
+            del logits
+
+        del out
+        return loss_sum, sample_count
+"""
+
+_COMMENT_EXPECTED = "        # All-reduce token counts and rescale gradients to get a global token-weighted mean."
+_COMMENT_REPLACEMENT = "        # All-reduce sample counts and rescale gradients to get a global sample-weighted mean."
+
+
+def _stubbed_flash_attn(*args, **kwargs):
+    raise RuntimeError(
+        "BenchFlow stubbed flash_attn imports because this run is configured "
+        "for model.attn=sdpa. A flash-attention kernel was called unexpectedly."
+    )
+
+
+def _install_flash_attn_stub():
+    package = types.ModuleType("flash_attn")
+    package.__benchflow_stub__ = True
+    package.__version__ = "0.0.0"
+    package.__path__ = []
+    package.__package__ = "flash_attn"
+    package.__spec__ = importlib.machinery.ModuleSpec(
+        "flash_attn", loader=None, is_package=True
+    )
+
+    interface = types.ModuleType("flash_attn.flash_attn_interface")
+    interface.__benchflow_stub__ = True
+    interface.__package__ = "flash_attn"
+    interface.__spec__ = importlib.machinery.ModuleSpec(
+        "flash_attn.flash_attn_interface", loader=None
+    )
+    for name in (
+        "_flash_attn_forward",
+        "_flash_attn_backward",
+        "_flash_attn_varlen_forward",
+        "_flash_attn_varlen_backward",
+        "flash_attn_func",
+        "flash_attn_qkvpacked_func",
+        "flash_attn_kvpacked_func",
+        "flash_attn_varlen_func",
+        "flash_attn_varlen_qkvpacked_func",
+        "flash_attn_varlen_kvpacked_func",
+        "flash_attn_with_kvcache",
+    ):
+        setattr(interface, name, _stubbed_flash_attn)
+        setattr(package, name, _stubbed_flash_attn)
+
+    package.flash_attn_interface = interface
+    sys.modules["flash_attn"] = package
+    sys.modules["flash_attn.flash_attn_interface"] = interface
+
+
+class _BenchFlowTransformersFlashAttnMapLoader(importlib.machinery.SourceFileLoader):
+    def exec_module(self, module):
+        super().exec_module(module)
+        mapping = getattr(module, "PACKAGE_DISTRIBUTION_MAPPING", None)
+        if isinstance(mapping, dict):
+            mapping.setdefault("flash_attn", ["flash-attn"])
+
+
+class _BenchFlowTransformersFlashAttnMapFinder(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if fullname != _TRANSFORMERS_IMPORT_UTILS_TARGET:
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+        if spec is None or not isinstance(
+            spec.loader, importlib.machinery.SourceFileLoader
+        ):
+            return None
+        spec.loader = _BenchFlowTransformersFlashAttnMapLoader(
+            spec.loader.name, spec.loader.path
+        )
+        return spec
+
+
+class _BenchFlowSampleMeanLoader(importlib.machinery.SourceFileLoader):
+    def get_code(self, fullname: str):
+        source_path = self.get_filename(fullname)
+        source_bytes = self.get_data(source_path)
+        return self.source_to_code(source_bytes, source_path)
+
+    def source_to_code(self, data, path, *, _optimize=-1):
+        source = data.decode("utf-8") if isinstance(data, bytes) else data
+        if _EXPECTED not in source:
+            raise RuntimeError(
+                "BenchFlow Prime-RL sample-mean shim could not find the expected "
+                f"loss block in {path}. Refusing to run against an unknown "
+                "Prime-RL train loop."
+            )
+        patched = source.replace(_EXPECTED, _REPLACEMENT, 1)
+        patched = patched.replace(_COMMENT_EXPECTED, _COMMENT_REPLACEMENT, 1)
+        return super().source_to_code(patched, path, _optimize=_optimize)
+
+
+class _BenchFlowSampleMeanFinder(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if fullname != _LOSS_TARGET or os.environ.get(_LOSS_ENV) != "1":
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+        if spec is None or not isinstance(
+            spec.loader, importlib.machinery.SourceFileLoader
+        ):
+            raise ImportError(
+                "BenchFlow Prime-RL sample-mean shim requires a source-backed "
+                f"loader for {_LOSS_TARGET}."
+            )
+        spec.loader = _BenchFlowSampleMeanLoader(spec.loader.name, spec.loader.path)
+        return spec
+
+
+class _BenchFlowPretokenizedDataLoader(importlib.machinery.SourceFileLoader):
+    def exec_module(self, module):
+        super().exec_module(module)
+        if os.environ.get(_DATA_ENV) != "1":
+            return
+        dataset_cls = getattr(module, "SFTDataset", None)
+        if dataset_cls is None:
+            raise RuntimeError(
+                "BenchFlow Prime-RL pretokenized data shim could not find "
+                "SFTDataset."
+            )
+        original_process = dataset_cls._process
+
+        def _as_int_list(example, key):
+            value = example.get(key)
+            if not isinstance(value, (list, tuple)):
+                raise ValueError(f"{key} must be a list")
+            return [int(item) for item in value]
+
+        def _as_bool_list(example, key):
+            value = example.get(key)
+            if not isinstance(value, (list, tuple)):
+                raise ValueError(f"{key} must be a list")
+            return [bool(item) for item in value]
+
+        def benchflow_process(self, example):
+            if (
+                isinstance(example, dict)
+                and example.get("benchflow_custom_trainer_pretokenized")
+            ):
+                input_ids = _as_int_list(example, "benchflow_input_ids")
+                target_ids = _as_int_list(example, "benchflow_target_ids")
+                loss_mask = _as_bool_list(example, "benchflow_loss_mask")
+                position_ids = _as_int_list(example, "benchflow_position_ids")
+                lengths = {
+                    len(input_ids),
+                    len(target_ids),
+                    len(loss_mask),
+                    len(position_ids),
+                }
+                if len(lengths) != 1:
+                    raise ValueError(
+                        "BenchFlow pretokenized SFT row has inconsistent "
+                        "input_ids/target_ids/loss_mask/position_ids lengths"
+                    )
+                if not input_ids:
+                    raise ValueError("BenchFlow pretokenized SFT row is empty")
+                if not any(loss_mask):
+                    raise ValueError(
+                        "BenchFlow pretokenized SFT row has no trainable tokens"
+                    )
+                return {
+                    "input_ids": input_ids,
+                    "target_ids": target_ids,
+                    "loss_mask": loss_mask,
+                    "position_ids": position_ids,
+                }
+            return original_process(self, example)
+
+        dataset_cls._process = benchflow_process
+        stateful_dataloader_cls = getattr(module, "StatefulDataLoader", None)
+        torch_mod = getattr(module, "torch", None)
+        if (
+            getattr(module, "setup_dataloader", None) is None
+            or stateful_dataloader_cls is None
+        ):
+            raise RuntimeError(
+                "BenchFlow Prime-RL pretokenized data shim could not find "
+                "setup_dataloader or StatefulDataLoader."
+            )
+
+        def benchflow_row_collate(samples):
+            if torch_mod is None:
+                raise RuntimeError(
+                    "BenchFlow row-wise pretokenized collate requires torch in "
+                    "prime_rl.trainer.sft.data."
+                )
+            if len(samples) != 1:
+                raise ValueError(
+                    "BenchFlow row-wise pretokenized dataloader expected one "
+                    f"sample per micro-batch, got {len(samples)}"
+                )
+            sample = samples[0]
+            return {
+                "input_ids": torch_mod.tensor(
+                    [sample["input_ids"]], dtype=torch_mod.long, device="cuda"
+                ),
+                "position_ids": torch_mod.tensor(
+                    [sample["position_ids"]], dtype=torch_mod.long, device="cuda"
+                ),
+                "target_ids": torch_mod.tensor(
+                    [sample["target_ids"]], dtype=torch_mod.long, device="cuda"
+                ),
+                "loss_mask": torch_mod.tensor(
+                    [sample["loss_mask"]], dtype=torch_mod.bool, device="cuda"
+                ),
+            }
+
+        def benchflow_setup_dataloader(dataset, config):
+            return stateful_dataloader_cls(
+                dataset, batch_size=1, collate_fn=benchflow_row_collate
+            )
+
+        module.setup_dataloader = benchflow_setup_dataloader
+        sys.stderr.write("BenchFlow Prime-RL pretokenized SFT data shim enabled\\n")
+
+
+class _BenchFlowPretokenizedDataFinder(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if fullname != _DATA_TARGET or os.environ.get(_DATA_ENV) != "1":
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+        if spec is None or not isinstance(
+            spec.loader, importlib.machinery.SourceFileLoader
+        ):
+            raise ImportError(
+                "BenchFlow Prime-RL pretokenized data shim requires a "
+                f"source-backed loader for {_DATA_TARGET}."
+            )
+        spec.loader = _BenchFlowPretokenizedDataLoader(
+            spec.loader.name, spec.loader.path
+        )
+        return spec
+
+
+if os.environ.get(_LOSS_ENV) == "1":
+    sys.meta_path.insert(0, _BenchFlowSampleMeanFinder())
+    sys.stderr.write("BenchFlow Prime-RL sample-mean loss shim enabled\\n")
+if os.environ.get(_DATA_ENV) == "1":
+    sys.meta_path.insert(0, _BenchFlowPretokenizedDataFinder())
+if os.environ.get(_FLASH_ATTN_ENV) == "1":
+    _install_flash_attn_stub()
+    sys.meta_path.insert(0, _BenchFlowTransformersFlashAttnMapFinder())
+    sys.stderr.write("BenchFlow Prime-RL flash-attn import stub enabled for SDPA\\n")
+'''
+
+
+def _write_prime_rl_sft_compat_shim(
+    work_dir: Path,
+    *,
+    sample_mean: bool,
+    pretokenized_data: bool,
+    stub_flash_attn: bool,
+) -> PrimeRlSftShimPlan:
+    shim_dir = work_dir / "prime-rl-sft-compat-shim"
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    sitecustomize = shim_dir / "sitecustomize.py"
+    sitecustomize.write_text(
+        _PRIME_RL_SFT_COMPAT_SITE_CUSTOMIZE.lstrip(), encoding="utf-8"
+    )
+    env = {"PYTHONPATH": str(shim_dir)}
+    guards: list[str] = []
+    if sample_mean:
+        env[_SAMPLE_MEAN_SHIM_ENV] = "1"
+        guards.extend(
+            [
+                "Prime-RL train.py loss block must match the known token-mean source",
+                "data.pack_function=stack",
+                "model.cp=1",
+                "loss_impl=torch or loss_impl=liger",
+                "every effective batch must contain at least one trainable row",
+            ]
+        )
+    if pretokenized_data:
+        env[_PRETOKENIZED_DATA_SHIM_ENV] = "1"
+        guards.extend(
+            [
+                "Prime-RL SFTDataset must be source-backed",
+                "pretokenized rows must carry input_ids/target_ids/loss_mask/position_ids",
+                "pretokenized rows bypass Prime-RL stack/cat packing and train one original row per micro-batch",
+            ]
+        )
+    if stub_flash_attn:
+        env[_STUB_FLASH_ATTN_ENV] = "1"
+        guards.extend(
+            [
+                "model.attn=sdpa",
+                "flash-attn imports may succeed, but any flash-attn kernel call raises",
+            ]
+        )
+    return PrimeRlSftShimPlan(
+        name="prime_rl_sft_compatibility",
+        description=(
+            "Import-time Prime-RL SFT compatibility shim that can change loss "
+            "reduction from token mean to per-sample mean and can feed "
+            "BenchFlow pre-tokenized custom-trainer tensor rows. For SDPA runs "
+            "it can also stub optional flash-attn imports while leaving the "
+            "Prime-RL package files untouched."
+        ),
+        shim_dir=str(shim_dir),
+        sitecustomize=str(sitecustomize),
+        env=env,
+        guards=tuple(guards),
+    )
+
+
+def _build_prime_rl_env(shim_plan: PrimeRlSftShimPlan | None) -> dict[str, str] | None:
+    if shim_plan is None:
+        return None
+    env = os.environ.copy()
+    shim_pythonpath = shim_plan.env["PYTHONPATH"]
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        shim_pythonpath
+        if not existing_pythonpath
+        else os.pathsep.join((shim_pythonpath, existing_pythonpath))
+    )
+    for key, value in shim_plan.env.items():
+        if key != "PYTHONPATH":
+            env[key] = value
+    return env
+
+
+def _command_env(shim_plan: PrimeRlSftShimPlan | None) -> dict[str, str]:
+    if shim_plan is None:
+        return {}
+    return dict(shim_plan.env)
+
+
+def _prepare_prime_rl_shim(
+    spec: PrimeRlSftSpec, work_dir: Path
+) -> PrimeRlSftShimPlan | None:
+    sample_mean = (
+        _normalize_loss_normalization(spec.loss_normalization)
+        == _SAMPLE_MEAN_LOSS_NORMALIZATION
+    )
+    pretokenized_data = (
+        _normalize_message_tail_truncation(spec.message_tail_truncation)
+        == _CUSTOM_TRAINER_PRETOKENIZED_MODE
+    )
+    stub_flash_attn = (
+        spec.model_attn is not None
+        and spec.model_attn.strip().lower() == "sdpa"
+        and (sample_mean or pretokenized_data)
+    )
+    if not sample_mean and not pretokenized_data and not stub_flash_attn:
+        return None
+    return _write_prime_rl_sft_compat_shim(
+        work_dir,
+        sample_mean=sample_mean,
+        pretokenized_data=pretokenized_data,
+        stub_flash_attn=stub_flash_attn,
+    )
+
+
 def _copy_stream(stream: TextIO, handle: TextIO, *, echo: bool) -> None:
     for line in stream:
         handle.write(line)
@@ -656,6 +1284,8 @@ class _JsonlTransformStats:
     message_tail_max_area: int | None = None
     message_tail_max_tokens_before: int | None = None
     message_tail_max_tokens_after: int | None = None
+    custom_trainer_pretokenized_rows: int | None = None
+    custom_trainer_pretokenized_trainable_tokens: int | None = None
 
 
 def _sha256_file(path: Path) -> str:
@@ -692,6 +1322,156 @@ def _load_tail_truncation_tokenizer(model_name: str) -> Any:
             "environment so BenchFlow can match Prime-RL tokenizer lengths"
         ) from exc
     return AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
+
+def _normalize_tool_call_for_custom_trainer(call: Mapping[str, Any]) -> dict[str, Any]:
+    normalized = json.loads(json.dumps(call))
+    function = normalized.get("function")
+    if not isinstance(function, dict):
+        function = {
+            "name": normalized.get("name") or "tool",
+            "arguments": normalized.get("arguments") or {},
+        }
+        normalized = {"type": "function", "function": function}
+    arguments = function.get("arguments")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            arguments = {"raw": arguments}
+    function["arguments"] = arguments or {}
+    return normalized
+
+
+def _normalize_messages_for_custom_trainer(messages: Any) -> list[dict[str, Any]]:
+    if not isinstance(messages, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, Mapping):
+            continue
+        item = dict(message)
+        if item.get("role") == "assistant" and item.get("tool_calls"):
+            tool_calls = item.get("tool_calls") or []
+            if not isinstance(tool_calls, list):
+                tool_calls = []
+            item["tool_calls"] = [
+                _normalize_tool_call_for_custom_trainer(call)
+                for call in tool_calls
+                if isinstance(call, Mapping)
+            ]
+        out.append(item)
+    return out
+
+
+def _render_custom_trainer_full_token_ids(
+    tokenizer: Any, row: Mapping[str, Any]
+) -> list[int]:
+    """Return the untruncated custom-trainer token stream for one source row."""
+    messages = _normalize_messages_for_custom_trainer(row.get("messages") or [])
+    if not messages:
+        return []
+    tools = row.get("tools") or None
+    try:
+        rendered = tokenizer.apply_chat_template(
+            messages,
+            tools=tools,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+    except TypeError:
+        rendered = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+    token_ids = tokenizer(rendered, add_special_tokens=False)["input_ids"]
+    return list(token_ids)
+
+
+def _custom_trainer_prefix_token_count(tokenizer: Any, row: Mapping[str, Any]) -> int:
+    messages = _normalize_messages_for_custom_trainer(row.get("messages") or [])
+    if not messages or messages[-1].get("role") != "assistant":
+        return 0
+    prefix_messages = messages[:-1]
+    tools = row.get("tools") or None
+    try:
+        rendered = tokenizer.apply_chat_template(
+            prefix_messages,
+            tools=tools,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    except TypeError:
+        rendered = tokenizer.apply_chat_template(
+            prefix_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    return len(tokenizer(rendered, add_special_tokens=False)["input_ids"])
+
+
+def _custom_trainer_pretokenized_row(
+    tokenizer: Any,
+    row: Mapping[str, Any],
+    *,
+    max_length: int,
+) -> tuple[dict[str, Any], int, int, int]:
+    """Stage one row as the exact shifted tensor sample used by Prime-RL.
+
+    The historical custom trainer passed ``input_ids`` and ``labels`` directly
+    to Hugging Face, whose CausalLM loss shifts labels internally. Prime-RL's
+    SFT loop shifts before the model call, so BenchFlow materializes the same
+    target positions as ``target_ids`` plus a boolean ``loss_mask``.
+    """
+    full_ids = _render_custom_trainer_full_token_ids(tokenizer, row)
+    before = len(full_ids)
+    if before < 2:
+        raise ValueError("cannot stage custom-trainer row with fewer than 2 tokens")
+
+    labels = list(full_ids)
+    if row.get("label_last_assistant_only"):
+        messages = _normalize_messages_for_custom_trainer(row.get("messages") or [])
+        if messages and messages[-1].get("role") == "assistant":
+            prefix_len = min(
+                _custom_trainer_prefix_token_count(tokenizer, row), len(labels)
+            )
+            labels = [-100] * prefix_len + labels[prefix_len:]
+
+    if len(full_ids) > max_length:
+        full_ids = full_ids[-max_length:]
+        labels = labels[-max_length:]
+    if len(full_ids) < 2:
+        raise ValueError("custom-trainer tail kept fewer than 2 tokens")
+
+    input_ids = full_ids[:-1]
+    target_ids = full_ids[1:]
+    loss_mask = [label != -100 for label in labels[1:]]
+    if not any(loss_mask):
+        raise ValueError("custom-trainer row has no trainable shifted labels")
+
+    staged = {
+        key: value
+        for key, value in row.items()
+        if key
+        not in {
+            "messages",
+            "tools",
+            "tool_defs",
+            "chat_template_kwargs",
+            "label_last_assistant_only",
+        }
+    }
+    staged["benchflow_custom_trainer_pretokenized"] = {
+        "original_token_count": before,
+        "staged_token_count": len(full_ids),
+        "trainable_token_count": int(sum(loss_mask)),
+    }
+    staged["benchflow_input_ids"] = input_ids
+    staged["benchflow_target_ids"] = target_ids
+    staged["benchflow_loss_mask"] = loss_mask
+    staged["benchflow_position_ids"] = list(range(len(input_ids)))
+    return staged, before, len(full_ids), int(sum(loss_mask))
 
 
 def _normalize_messages_for_prime_rl_render(
@@ -928,6 +1708,8 @@ def _copy_prime_rl_jsonl(
     removed_rows = 0
     chat_template_kwargs_rows = 0
     message_tail_truncated_rows = 0
+    custom_trainer_pretokenized_rows = 0
+    custom_trainer_pretokenized_trainable_tokens = 0
     max_tokens_before: int | None = None
     max_tokens_after: int | None = None
     with (
@@ -941,6 +1723,32 @@ def _copy_prime_rl_jsonl(
             row = json.loads(line)
             if not isinstance(row, dict):
                 raise ValueError(f"{source}: every JSONL row must be an object")
+            if message_tail_truncation == _CUSTOM_TRAINER_PRETOKENIZED_MODE:
+                if omit_tool_defs and ("tool_defs" in row or "tools" in row):
+                    removed_rows += 1
+                if tokenizer is None or message_tail_max_area is None:
+                    raise AssertionError(
+                        "custom-trainer pretokenized staging requires tokenizer "
+                        "and max area"
+                    )
+                row, before, after, trainable_tokens = _custom_trainer_pretokenized_row(
+                    tokenizer,
+                    row,
+                    max_length=message_tail_max_area,
+                )
+                custom_trainer_pretokenized_rows += 1
+                custom_trainer_pretokenized_trainable_tokens += trainable_tokens
+                message_tail_truncated_rows += int(before > after)
+                max_tokens_before = (
+                    before
+                    if max_tokens_before is None
+                    else max(max_tokens_before, before)
+                )
+                max_tokens_after = (
+                    after if max_tokens_after is None else max(max_tokens_after, after)
+                )
+                dst.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+                continue
             if omit_tool_defs and ("tool_defs" in row or "tools" in row):
                 removed_rows += 1
             if omit_tool_defs:
@@ -1004,6 +1812,16 @@ def _copy_prime_rl_jsonl(
         ),
         message_tail_max_tokens_before=max_tokens_before,
         message_tail_max_tokens_after=max_tokens_after,
+        custom_trainer_pretokenized_rows=(
+            custom_trainer_pretokenized_rows
+            if message_tail_truncation == _CUSTOM_TRAINER_PRETOKENIZED_MODE
+            else None
+        ),
+        custom_trainer_pretokenized_trainable_tokens=(
+            custom_trainer_pretokenized_trainable_tokens
+            if message_tail_truncation == _CUSTOM_TRAINER_PRETOKENIZED_MODE
+            else None
+        ),
     )
 
 
@@ -1020,9 +1838,23 @@ def _prepare_prime_rl_data(
         if message_tail_truncation != "off":
             raise ValueError("--message-tail-truncation requires --data")
         return spec, None
+    source_data = spec.data
 
     tool_defs_mode = _normalize_tool_defs_mode(spec.tool_defs_mode)
     chat_template_kwargs = _parse_chat_template_kwargs(spec.chat_template_kwargs)
+    if message_tail_truncation == _CUSTOM_TRAINER_PRETOKENIZED_MODE:
+        if tool_defs_mode != "omit":
+            raise ValueError(
+                f"--message-tail-truncation {_CUSTOM_TRAINER_PRETOKENIZED_MODE} "
+                "requires --tool-defs-mode omit because it stages pre-tokenized "
+                "custom-trainer tensors instead of chat/tool schema rows"
+            )
+        if chat_template_kwargs:
+            raise ValueError(
+                f"--message-tail-truncation {_CUSTOM_TRAINER_PRETOKENIZED_MODE} "
+                "stages pre-tokenized tensors and cannot be combined with "
+                "--chat-template-kwarg"
+            )
     effective_overrides = _override_map(spec.overrides)
     message_tail_max_area: int | None = None
     tokenizer: Any | None = None
@@ -1093,7 +1925,7 @@ def _prepare_prime_rl_data(
             transformed_train_jsonl = dataset_dir / "train.jsonl"
             resolved_spec = replace(spec, data=str(dataset_dir))
             return resolved_spec, PrimeRlSftDatasetPlan(
-                source_data=spec.data,
+                source_data=source_data,
                 resolved_data=str(dataset_dir),
                 kind="local_dataset_dir_transformed",
                 dataset_dir=str(dataset_dir),
@@ -1109,11 +1941,17 @@ def _prepare_prime_rl_data(
                 message_tail_max_area=stats.message_tail_max_area,
                 message_tail_max_tokens_before=stats.message_tail_max_tokens_before,
                 message_tail_max_tokens_after=stats.message_tail_max_tokens_after,
+                custom_trainer_pretokenized_rows=(
+                    stats.custom_trainer_pretokenized_rows
+                ),
+                custom_trainer_pretokenized_trainable_tokens=(
+                    stats.custom_trainer_pretokenized_trainable_tokens
+                ),
                 validation=validation,
             )
         resolved_spec = replace(spec, data=str(source_path))
         return resolved_spec, PrimeRlSftDatasetPlan(
-            source_data=spec.data,
+            source_data=source_data,
             resolved_data=str(source_path),
             kind="local_dataset_dir",
             dataset_dir=str(source_path),
@@ -1158,7 +1996,7 @@ def _prepare_prime_rl_data(
     train_jsonl = dataset_dir / "train.jsonl"
     resolved_spec = replace(spec, data=str(dataset_dir))
     return resolved_spec, PrimeRlSftDatasetPlan(
-        source_data=spec.data,
+        source_data=source_data,
         resolved_data=str(dataset_dir),
         kind="local_jsonl_packaged",
         dataset_dir=str(dataset_dir),
@@ -1174,6 +2012,10 @@ def _prepare_prime_rl_data(
         message_tail_max_area=stats.message_tail_max_area,
         message_tail_max_tokens_before=stats.message_tail_max_tokens_before,
         message_tail_max_tokens_after=stats.message_tail_max_tokens_after,
+        custom_trainer_pretokenized_rows=stats.custom_trainer_pretokenized_rows,
+        custom_trainer_pretokenized_trainable_tokens=(
+            stats.custom_trainer_pretokenized_trainable_tokens
+        ),
         validation=validation,
     )
 
@@ -1184,6 +2026,7 @@ def _initial_manifest(
     logs: list[str],
     exposure_plan: PrimeRlSftExposurePlan | None = None,
     dataset_plan: PrimeRlSftDatasetPlan | None = None,
+    shim_plan: PrimeRlSftShimPlan | None = None,
 ) -> TrainRunManifest:
     work_dir = spec.work_dir.resolve()
     output_dir = (
@@ -1221,20 +2064,25 @@ def _initial_manifest(
         manifest.extra["prime_rl_sft_exposure_plan"] = exposure_plan.to_dict()
     if dataset_plan is not None:
         manifest.extra["prime_rl_sft_dataset"] = dataset_plan.to_dict()
+    if shim_plan is not None:
+        manifest.extra["prime_rl_sft_shim"] = shim_plan.to_dict()
     if spec.compat_profile:
         manifest.extra["prime_rl_sft_compat_profile"] = {
             "name": spec.compat_profile,
             "description": (
                 "BenchFlow Mobile300 PR828 Prime-RL wrapper settings that match "
                 "the historical custom-trainer run where Prime-SFT rows had "
-                "tool_defs but no tools and Qwen3.5 thinking was disabled in the "
-                "chat-template render."
+                "tool_defs but no tools and max_steps counted batch-size-1 "
+                "micro-batches before gradient accumulation."
             ),
             "resolved_settings": {
                 "target_examples": spec.target_examples,
+                "target_micro_steps": spec.target_micro_steps,
                 "sync_scheduler_to_max_steps": spec.sync_scheduler_to_max_steps,
+                "sync_ckpt_to_max_steps": spec.sync_ckpt_to_max_steps,
                 "pack_function": spec.pack_function,
                 "loss_mask": spec.loss_mask,
+                "loss_normalization": spec.loss_normalization,
                 "model_attn": spec.model_attn,
                 "renderer_mode": spec.renderer_mode,
                 "tool_defs_mode": spec.tool_defs_mode,
@@ -1244,9 +2092,15 @@ def _initial_manifest(
                 "message_tail_truncation": spec.message_tail_truncation,
             },
             "known_prime_rl_gap": (
-                "Prime-RL still owns sequence packing; BenchFlow only stages "
-                "local rows to avoid known head truncation where possible and "
-                "does not patch Prime-RL internals."
+                "BenchFlow stages each row as the historical custom trainer's "
+                "shifted input_ids/target_ids/loss_mask tensors and enables a "
+                "run-local Prime-RL data shim so Prime-RL trains those tensors "
+                "without message rerendering. BenchFlow also enables a run-local "
+                "sample-mean loss shim because Prime-RL's native SFT loop "
+                "normalizes by trainable token count, while the historical custom "
+                "trainer averaged per-row losses. The Prime-RL optimizer, "
+                "scheduler, checkpoint writer, and batch ordering are still "
+                "Prime-RL implementations."
             ),
         }
     return manifest
@@ -1277,7 +2131,15 @@ def run_prime_rl_sft(spec: PrimeRlSftSpec) -> PrimeRlSftResult:
     launch_spec, dataset_plan = _prepare_prime_rl_data(spec, work_dir, config_data)
     launch = build_prime_rl_sft_launch(launch_spec)
     argv = launch.argv
-    command_path.write_text(_shell_quote(argv) + "\n", encoding="utf-8")
+    shim_plan = _prepare_prime_rl_shim(launch_spec, work_dir)
+    command_env = _command_env(shim_plan)
+    command_prefix = _shell_quote_env(command_env)
+    command_text = (
+        f"{command_prefix} {_shell_quote(argv)}"
+        if command_prefix
+        else _shell_quote(argv)
+    )
+    command_path.write_text(command_text + "\n", encoding="utf-8")
     manifest = _initial_manifest(
         launch_spec,
         argv,
@@ -1287,6 +2149,7 @@ def run_prime_rl_sft(spec: PrimeRlSftSpec) -> PrimeRlSftResult:
         ],
         launch.exposure_plan,
         dataset_plan,
+        shim_plan,
     )
     manifest.overall_status = "running"
     manifest.components[0].status = "running"
@@ -1300,6 +2163,7 @@ def run_prime_rl_sft(spec: PrimeRlSftSpec) -> PrimeRlSftResult:
         process = subprocess.Popen(
             argv,
             cwd=str(cwd),
+            env=_build_prime_rl_env(shim_plan),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,

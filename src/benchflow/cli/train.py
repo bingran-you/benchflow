@@ -71,6 +71,17 @@ def register_train(app: typer.Typer) -> None:
                 help="Restrict conversion to rows selected by canonical-selection.json",
             ),
         ] = None,
+        redact: Annotated[
+            bool,
+            typer.Option(
+                "--redact/--no-redact",
+                help=(
+                    "Redact secrets while exporting trainer JSONL. Use --no-redact "
+                    "only for private local SFT data when preserving exact tool-call "
+                    "argument tokens is required."
+                ),
+            ),
+        ] = True,
     ) -> None:
         """Convert BenchFlow rollout artifacts into trainer-ready data."""
         _ensure_prime_sft(format_name)
@@ -85,6 +96,7 @@ def register_train(app: typer.Typer) -> None:
                 expected_rows=expected_rows,
                 manifest=manifest,
                 canonical_selection=canonical_selection,
+                redact=redact,
             )
         except ValueError as exc:
             print_error(str(exc))
@@ -285,7 +297,17 @@ def register_train(app: typer.Typer) -> None:
                 "--target-examples",
                 help=(
                     "Derive Prime-RL max_steps from a target number of training "
-                    "examples using data.batch_size"
+                    "examples using data.batch_size, rounding up"
+                ),
+            ),
+        ] = None,
+        target_micro_steps: Annotated[
+            int | None,
+            typer.Option(
+                "--target-micro-steps",
+                help=(
+                    "Derive Prime-RL max_steps from custom-trainer batch-size-1 "
+                    "microsteps, dropping the final partial accumulation"
                 ),
             ),
         ] = None,
@@ -294,11 +316,21 @@ def register_train(app: typer.Typer) -> None:
             typer.Option(
                 "--sync-scheduler-to-max-steps/--no-sync-scheduler-to-max-steps",
                 help=(
-                    "When --target-examples is set, also derive "
-                    "scheduler.decay_steps from the computed max_steps"
+                    "When --target-examples or --target-micro-steps is set, "
+                    "also derive scheduler.decay_steps from the computed max_steps"
                 ),
             ),
         ] = True,
+        sync_ckpt_to_max_steps: Annotated[
+            bool,
+            typer.Option(
+                "--sync-ckpt-to-max-steps/--no-sync-ckpt-to-max-steps",
+                help=(
+                    "When deriving max_steps, also derive ckpt.interval and "
+                    "ckpt.keep_interval from the computed max_steps"
+                ),
+            ),
+        ] = False,
         pack_function: Annotated[
             str | None,
             typer.Option(
@@ -313,6 +345,17 @@ def register_train(app: typer.Typer) -> None:
                 help=(
                     "Optional first-class Prime-RL data.loss_mask override: "
                     "'assistant', 'all', or comma-separated roles"
+                ),
+            ),
+        ] = None,
+        loss_normalization: Annotated[
+            str | None,
+            typer.Option(
+                "--loss-normalization",
+                help=(
+                    "Prime-RL SFT loss normalization: token_mean for native "
+                    "Prime-RL behavior, or sample_mean to match the historical "
+                    "custom trainer's per-row mean loss"
                 ),
             ),
         ] = None,
@@ -360,9 +403,13 @@ def register_train(app: typer.Typer) -> None:
                 "--message-tail-truncation",
                 help=(
                     "Local Prime-SFT row truncation before Prime-RL tokenizes it: "
-                    "off or keep-first-user. The keep-first-user mode keeps the "
-                    "initial user instruction plus the longest final message "
-                    "suffix that fits data.seq_len * data.micro_batch_size."
+                    "off, keep-first-user, or custom-trainer-pretokenized. "
+                    "The keep-first-user mode keeps the initial user instruction "
+                    "plus the longest final message suffix that fits "
+                    "data.seq_len * data.micro_batch_size. The "
+                    "custom-trainer-pretokenized mode renders rows like the "
+                    "historical custom trainer, keeps the exact token tail, "
+                    "and stages shifted input_ids/target_ids/loss_mask tensors."
                 ),
             ),
         ] = "off",
@@ -439,9 +486,12 @@ def register_train(app: typer.Typer) -> None:
                     uv_no_sync=uv_no_sync,
                     overrides=tuple(override or ()),
                     target_examples=target_examples,
+                    target_micro_steps=target_micro_steps,
                     sync_scheduler_to_max_steps=sync_scheduler_to_max_steps,
+                    sync_ckpt_to_max_steps=sync_ckpt_to_max_steps,
                     pack_function=pack_function,
                     loss_mask=loss_mask,
+                    loss_normalization=loss_normalization,
                     model_attn=model_attn,
                     renderer_mode=renderer_mode,
                     tool_defs_mode=tool_defs_mode,
