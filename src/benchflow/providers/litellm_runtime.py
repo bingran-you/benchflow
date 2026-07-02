@@ -420,9 +420,41 @@ def _write_runtime_files(
     return config_path, callback_path, patch_path
 
 
-async def _poll_host_health(process: HostLiteLLMProcess) -> None:
+# How long to wait for the *host* per-run LiteLLM proxy to become healthy.
+# litellm's cold start runs tens of seconds, and when many runs launch in parallel
+# (max-parallel sweeps) the proxies cold-start simultaneously and contend for CPU,
+# pushing well past a fixed ~30s budget — the old ``range(120)`` x 0.25s. That
+# surfaced as "LiteLLM did not become healthy: All connection attempts failed" for
+# otherwise-fine agents on Docker under load. Use a generous, time-based, env-tunable
+# deadline so a slow-but-fine proxy is not killed; a genuine crash still fails fast
+# via the process-exit check below.
+#
+# Scope: this deadline covers only ``_poll_host_health``. The in-sandbox proxy
+# pollers (``_wait_for_sandbox_state`` / ``_poll_sandbox_health``) keep their own
+# ``range(120)`` loop, where each iteration is bounded by a ``sandbox.exec`` round
+# trip rather than a fixed 0.25s sleep — so they already wait far longer than 30s
+# and are deliberately not governed by this budget.
+def _health_deadline_sec() -> float:
+    # Parse defensively: a malformed BENCHFLOW_LITELLM_HEALTH_TIMEOUT_SEC must not
+    # crash ``import benchflow``. Floor at one poll cycle so a 0/negative value still
+    # checks process liveness and attempts health once instead of raising immediately.
+    try:
+        deadline = float(os.environ.get("BENCHFLOW_LITELLM_HEALTH_TIMEOUT_SEC", "180"))
+    except (TypeError, ValueError):
+        deadline = 180.0
+    return max(deadline, 1.0)
+
+
+_HEALTH_DEADLINE_SEC = _health_deadline_sec()
+
+
+async def _poll_host_health(
+    process: HostLiteLLMProcess, deadline_s: float = _HEALTH_DEADLINE_SEC
+) -> None:
     last_error = ""
-    for _ in range(120):
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    while loop.time() - start < deadline_s:
         if process.process.poll() is not None:
             raise RuntimeError(
                 "LiteLLM exited before becoming healthy.\n" + process.log_tail()
@@ -437,7 +469,8 @@ async def _poll_host_health(process: HostLiteLLMProcess) -> None:
             last_error = str(exc)
         await asyncio.sleep(0.25)
     raise RuntimeError(
-        f"LiteLLM did not become healthy: {last_error}\n{process.log_tail()}"
+        f"LiteLLM did not become healthy after {deadline_s:.0f}s: "
+        f"{last_error}\n{process.log_tail()}"
     )
 
 
@@ -628,7 +661,9 @@ async def _upload_runtime_files_to_sandbox(
     return paths
 
 
-async def _ensure_sandbox_litellm(sandbox: Any, *, venv_dir: str) -> str:
+async def _ensure_sandbox_litellm(
+    sandbox: Any, *, venv_dir: str, install_timeout_sec: int = 600
+) -> str:
     vq = shlex.quote(venv_dir)
     # Prefer uv to bootstrap the venv: many sandbox base images ship a python3
     # without ensurepip and marked externally-managed (PEP 668), where both
@@ -663,7 +698,7 @@ import litellm
 print(litellm.__version__ if hasattr(litellm, "__version__") else "ok")
 PY
 """
-    result = await sandbox.exec(command, timeout_sec=600)
+    result = await sandbox.exec(command, timeout_sec=install_timeout_sec)
     if result.return_code != 0:
         raise RuntimeError(_exec_details("install LiteLLM in sandbox", result))
     return f"{venv_dir}/bin/python"
@@ -746,6 +781,7 @@ async def _start_sandbox_litellm(
     agent_env: dict[str, str],
     session_id: str,
     agent_name: str,
+    install_timeout_sec: int = 600,
 ) -> SandboxLiteLLMProcess:
     token = uuid4().hex[:16]
     runtime_dir = f"{LITELLM_SANDBOX_ROOT}/{token}"
@@ -755,7 +791,9 @@ async def _start_sandbox_litellm(
         runtime_dir=runtime_dir,
         config=config,
     )
-    python = await _ensure_sandbox_litellm(sandbox, venv_dir=paths["venv"])
+    python = await _ensure_sandbox_litellm(
+        sandbox, venv_dir=paths["venv"], install_timeout_sec=install_timeout_sec
+    )
     env = dict(agent_env)
     env.update(
         {
@@ -1022,6 +1060,24 @@ def _wire_litellm_agent_env(
             LITELLM_MASTER_KEY_ENV: master_key,
         }
     )
+    # Generic model-via-env: an agent whose registration maps
+    # BENCHFLOW_PROVIDER_MODEL into an agent-native env var AND declares
+    # supports_acp_set_model=False states, in data, that launch/env config owns
+    # model selection. Set the via-env flag so the ACP layer
+    # (_model_selection_owned_by_env) skips driving set_model AND any
+    # capability-advertised model config option — several agents (qwen-code,
+    # kilo, dimcode, ...) validate foreign model ids against their own catalog
+    # and reject the gateway alias with -32603. This generalizes the hardcoded
+    # codex-acp/openhands/claude-agent-acp branches below to every agent that
+    # declares the env-owned-model shape (e.g. the benchflow-ai/agents
+    # manifests), instead of growing the special-case list per agent.
+    _cfg = AGENTS.get(agent)
+    if (
+        _cfg is not None
+        and not _cfg.supports_acp_set_model
+        and _cfg.env_mapping.get("BENCHFLOW_PROVIDER_MODEL")
+    ):
+        updated[LITELLM_MODEL_VIA_ENV] = "1"
     if agent == "codex-acp":
         updated["OPENAI_BASE_URL"] = openai_base_url
         updated["OPENAI_API_KEY"] = master_key
@@ -1119,6 +1175,7 @@ async def ensure_litellm_runtime(
     session_id: str = "",
     usage_tracking: UsageTrackingConfig | dict[str, Any] | str | None = None,
     sandbox: Any | None = None,
+    sandbox_setup_timeout: int = 120,
 ) -> tuple[dict[str, str], Any | None]:
     """Start/reuse LiteLLM and rewrite the agent env to talk to it.
 
@@ -1207,6 +1264,7 @@ async def ensure_litellm_runtime(
                 agent_env=agent_env,
                 session_id=session_id,
                 agent_name=agent,
+                install_timeout_sec=max(600, int(sandbox_setup_timeout)),
             )
         else:
             server = await _start_host_litellm(
