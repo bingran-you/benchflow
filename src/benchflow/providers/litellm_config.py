@@ -345,8 +345,17 @@ def resolve_litellm_route(model: str, env: dict[str, str]) -> LiteLLMRoute:
         required = ("OPENAI_API_KEY",)
 
     params: dict[str, str | int | float | bool] = {"model": upstream}
+    if upstream.lower().startswith("gemini/"):
+        explicit_api_base = (env.get("BENCHFLOW_PROVIDER_BASE_URL") or "").strip()
+        explicit_api_key = (env.get("BENCHFLOW_PROVIDER_API_KEY") or "").strip()
+        if explicit_api_base:
+            params["api_base"] = explicit_api_base
+            if explicit_api_key:
+                params["api_key"] = _env_ref("BENCHFLOW_PROVIDER_API_KEY")
+                required = ("BENCHFLOW_PROVIDER_API_KEY",)
+
     key = required[0] if required else None
-    if key:
+    if key and "api_key" not in params:
         params["api_key"] = _env_ref(key)
     return LiteLLMRoute(
         requested_model=model,
@@ -383,6 +392,30 @@ def litellm_proxy_config(
             model_list.append(
                 {"model_name": model_name, "litellm_params": dict(params)}
             )
+
+    # Responses-API bridge entries. A responses-only client (e.g. the codex CLI,
+    # which dropped the chat wire) hits /v1/responses, but a chat-only OpenAI-
+    # compatible backend (deepseek, vllm) has no /responses endpoint — LiteLLM's
+    # native responses path then 404s the model. Register the same model under an
+    # ``openai/chat_completions/<name>`` model_name whose UPSTREAM carries that
+    # prefix; LiteLLM strips it and bridges responses→chat_completions
+    # (use_chat_completions_api), so /v1/responses reaches the chat backend. Only
+    # for openai/-prefixed upstreams (chat-only); native-responses providers are
+    # untouched, and the bridge names are never sent on the /chat route.
+    upstream = str(params.get("model", ""))
+    if upstream.startswith("openai/") and bare_requested:
+        bridge_params = {**params, "model": f"openai/chat_completions/{bare_requested}"}
+        existing = {entry["model_name"] for entry in model_list}
+        # Non-slashed bridge model_names (the codex CLI mis-parses a slashed model
+        # id and then sends no request); the prefix that triggers the bridge lives
+        # on the UPSTREAM (bridge_params["model"]), not the client-facing name.
+        for name in (route.model_alias, bare_requested):
+            bridge_name = f"{name}-responses-bridge"
+            if bridge_name not in existing:
+                existing.add(bridge_name)
+                model_list.append(
+                    {"model_name": bridge_name, "litellm_params": dict(bridge_params)}
+                )
     return {
         "model_list": model_list,
         "general_settings": {"master_key": master_key},
