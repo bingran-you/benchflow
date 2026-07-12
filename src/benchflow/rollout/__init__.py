@@ -212,6 +212,7 @@ from benchflow.trajectories._capture import (
     _scrape_agent_trajectory,
     make_trajectory_sink,
 )
+from benchflow.trajectories._llm_capture import LiveLLMTrajectoryWriter
 from benchflow.trajectories.tree import RolloutNode, RolloutTree, Step
 from benchflow.usage_tracking import (
     USAGE_SOURCE_AGENT_NATIVE_ACP,
@@ -920,6 +921,15 @@ class Rollout:
         self._effective_task_path = effective_task_path
         self._effective_skills_dir = effective_skills_dir
         self._effective_skills_sandbox_dir = task_skill_policy.sandbox_dir
+        self._required_skill_names = (
+            tuple(
+                sorted(
+                    path.parent.name for path in effective_skills_dir.glob("*/SKILL.md")
+                )
+            )
+            if effective_skills_dir is not None
+            else ()
+        )
 
         # Honour an externally-supplied sandbox (use_prebuilt_env, set by
         # Runtime.execute() when the caller passes a live Environment).
@@ -1176,6 +1186,8 @@ class Rollout:
             usage_tracking=cfg.usage_tracking,
             sandbox=self._env,
             sandbox_setup_timeout=cfg.sandbox_setup_timeout,
+            required_skill_names=getattr(self, "_required_skill_names", ()),
+            live_trajectory_path=rollout_dir / "trajectory" / "llm_trajectory.jsonl",
         )
         sf_entrypoint = self._session_factory_entrypoint(cfg.primary_agent)
         self._is_session_factory = sf_entrypoint is not None
@@ -2133,6 +2145,8 @@ class Rollout:
             usage_tracking=cfg.usage_tracking,
             sandbox=self._env,
             sandbox_setup_timeout=cfg.sandbox_setup_timeout,
+            required_skill_names=getattr(self, "_required_skill_names", ()),
+            live_trajectory_path=rollout_dir / "trajectory" / "llm_trajectory.jsonl",
         )
 
         role_agent_differs = role.agent != cfg.primary_agent
@@ -2329,11 +2343,9 @@ class Rollout:
         trajectory = getattr(getattr(usage_runtime, "server", None), "trajectory", None)
         if trajectory is None or not trajectory.exchanges:
             return
-        traj_dir = self._rollout_dir / "trajectory"
-        traj_dir.mkdir(parents=True, exist_ok=True)
-        (traj_dir / "llm_trajectory.jsonl").write_text(
-            trajectory.to_jsonl(redact_keys=True)
-        )
+        LiveLLMTrajectoryWriter(
+            self._rollout_dir / "trajectory" / "llm_trajectory.jsonl"
+        ).reconcile(trajectory)
 
     def _usage_tracking_metadata(self) -> dict[str, Any]:
         usage_cfg = self._config.usage_tracking.with_env_defaults()
