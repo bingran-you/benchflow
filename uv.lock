@@ -388,7 +388,7 @@ requires-dist = [
     { name = "tenacity", marker = "extra == 'sandbox-modal'", specifier = ">=8.0" },
     { name = "tomli-w", specifier = ">=1.0" },
     { name = "transformers", marker = "extra == 'train'", specifier = "==5.6.2" },
-    { name = "trl", marker = "extra == 'trl'", specifier = ">=0.24.0" },
+    { name = "trl", marker = "extra == 'trl'", specifier = ">=1.8.0,<2" },
     { name = "ty", marker = "extra == 'dev'", specifier = ">=0.0.1a1" },
     { name = "typer", specifier = ">=0.9" },
 ]
@@ -621,14 +621,14 @@ wheels = [
 
 [[package]]
 name = "click"
-version = "8.3.1"
+version = "8.4.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "colorama", marker = "sys_platform == 'win32'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3d/fa/656b739db8587d7b5dfa22e22ed02566950fbfbcdc20311993483657a5c0/click-8.3.1.tar.gz", hash = "sha256:12ff4785d337a1bb490bb7e9c2b1ee5da3112e94a8622f26a6c77f5d2fc6842a", size = 295065, upload-time = "2025-11-15T20:45:42.706Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/76/d4/81420972a676e8ffea40450d8c8c92943e7218a78fe9b64359836cc9876b/click-8.4.2.tar.gz", hash = "sha256:9a6cea6e60b17ebe0a44c5cc636d94f09bd66142c1cd7d8b4cd731c4917a15f6", size = 338000, upload-time = "2026-06-24T17:45:15.148Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/98/78/01c019cdb5d6498122777c1a43056ebb3ebfeef2076d9d026bfe15583b2b/click-8.3.1-py3-none-any.whl", hash = "sha256:981153a64e25f12d547d3426c367a4857371575ee7ad18df2a6183ab0545b2a6", size = 108274, upload-time = "2025-11-15T20:45:41.139Z" },
+    { url = "https://files.pythonhosted.org/packages/fb/e2/79c688af8b210d232694e31e59da9f6ec747bae31c3f5946e4e9b98860d5/click-8.4.2-py3-none-any.whl", hash = "sha256:e6f9f66136c816745b9d65817da91d61d957fb16e02e4dcd0552553c5a197b76", size = 119243, upload-time = "2026-06-24T17:45:13.73Z" },
 ]
 
 [[package]]
@@ -3981,7 +3981,7 @@ wheels = [
 
 [[package]]
 name = "trl"
-version = "1.7.1"
+version = "1.8.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate" },
@@ -3990,9 +3990,9 @@ dependencies = [
     { name = "packaging" },
     { name = "transformers" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/39/74/34b50058ea7d8c2a1c0bec49dcb6dda4ac929589bace52522fe8d1487306/trl-1.7.1.tar.gz", hash = "sha256:36609abf76f61d305d4c8a8ad5c903b79f177b7e5c4ec1014c4ade4cb7ac4a43", size = 691318, upload-time = "2026-07-04T04:03:09.841Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/69/d2/0bde76fff71f577dd3497ac2daefe4fa093f28791dd636228ebd17165bd5/trl-1.8.0.tar.gz", hash = "sha256:b7fc6ed021bb288e02f8530a4f809a182fe689440c84a47c9d8e35897bea0af1", size = 717196, upload-time = "2026-07-09T18:32:19.279Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/82/34/24d445a6156db4a9b976b1ab4aefc5e8ee8046da95524768fb78a0f705f0/trl-1.7.1-py3-none-any.whl", hash = "sha256:d5ef8ac38c64746eebf23005dccefc6488874643039d0b4a20f036e1124115b4", size = 842380, upload-time = "2026-07-04T04:03:08.223Z" },
+    { url = "https://files.pythonhosted.org/packages/eb/ad/0eede5c5d5a643aa8fab3336a01645fe38a3cb1b64a0df665c06c3d1ac17/trl-1.8.0-py3-none-any.whl", hash = "sha256:6fae1e592162907f952d3a909c8e152e3e046851c870ae9b973cbe9e259b0005", size = 863216, upload-time = "2026-07-09T18:32:17.64Z" },
 ]
 
 [[package]]
