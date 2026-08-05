@@ -2,7 +2,62 @@
 
 ## [Unreleased]
 
+### Fixed
+- Isolated pull-request and post-test integration concurrency groups so a
+  credential-free workflow completion cannot cancel an active PR rollout.
+
+## 0.6.6 — 2026-08-04
+
 ### Added
+- **Apple Container and Amazon Bedrock AgentCore sandboxes.** Apple Silicon
+  users can run supported single-container arm64 tasks through Apple's
+  Virtualization.framework, while `--sandbox agentcore` builds task-specific
+  AWS runtimes with lease-aware cleanup for supported public-network,
+  single-container arm64 tasks. (#936, #937)
+- **Rubric review (`bench review`).** Detached agentic grading of finished
+  rollouts against a `rubric.json` — rubric contract **v0.1**: an object with
+  a `criteria` list, each entry carrying a `name` (structured-output field), a
+  `description` (author documentation, never shown to the reviewer), and
+  `guidance` (the grading contract). The document carries no in-file
+  version key. One
+  reviewer agent per rollout runs as an ordinary rollout of a throwaway
+  wrapper task on a digest-pinned multi-architecture base image and no
+  task-authored Dockerfile
+  (AgentCore still builds a derived runtime image), reads a read-only evidence
+  copy of the rollout and, when admitted from a trusted `--tasks-root` with a
+  verified digest, its task, and answers every criterion with `pass` / `fail` /
+  `not_applicable` plus an explanation. The wrapper's own reward means only
+  "the reviewer produced a structurally valid result"; graded outcomes land
+  in `review_report.json`. Reviews never modify a reviewed rollout's rewards
+  or `result.json`. Rubric resolution: `-r` > the task's own
+  `verifier/rubric.json` > a built-in default (`reward_hacking`,
+  `task_specification`). `--passing` / `--failing` filter the rollouts under
+  review; a job-level prose summary aggregates multi-rollout runs. The
+  default reviewer harness is `opencode` (pinned to `1.18.11`).
+  Evidence mounts at `/evidence` outside the agent workdir (root-owned,
+  unwritable by the reviewer), symlinks are dropped rather than
+  dereferenced, task skills, shipped rubrics, and cumulative provider-history
+  trajectories are excluded while the canonical ACP trajectory is retained;
+  dropped ACP tool observations and generic tool titles are repaired from
+  exact-ID events in the trusted provider capture,
+  reviewer egress is gateway-scoped via the sandbox lockdown flag, artifact
+  consumption is pinned to each invocation's unique runtime leaf, and the
+  job summary is a deterministic aggregation.
+- **Sealed AgentCore uploads.** Every AgentCore **upload and staged
+  environment** is now encrypted end-to-end: the sandbox generates a
+  keypair, only the public key appears in command output, payloads travel
+  as AES-256-CTR ciphertext with an HMAC-SHA256 tag over IV and
+  ciphertext (verified before decryption), and the decrypted key never
+  appears in command text. Fixes provider credentials from
+  `launch_config.json` and command environments being recoverable from
+  the runtime's CloudWatch command log; the generated wrapper image
+  installs `openssl` when missing. Downloads are not sealed: they return
+  file contents as base64 through command output, so they must only carry
+  non-secret run artifacts.
+- **`RolloutConfig.uploads`.** Generic post-start host→sandbox uploads
+  (directory or file → absolute sandbox path), used by rubric review to
+  deliver evidence into prebuilt-image sandboxes and available to any caller
+  whose task data is not baked into the image.
 - **Native TRL tool-calling SFT export.** `bench train convert --format
   trl-sft` emits conversational prompt/completion rows with a `tools` column,
   excludes OpenCode title/summary helper calls, and accepts rollout trees,
@@ -15,6 +70,30 @@
 - **LLM call-purpose provenance.** Captured LLM exchanges retain provider/model
   metadata and classify agent, title, summary, compaction, and helper calls;
   `results.jsonl` carries the metadata on each trajectory step. (#925)
+- **Live trajectory streaming and token logprobs.** Redacted LLM trajectory
+  snapshots are written during active rollouts, and training runs can opt into
+  sampled-token logprobs with `BENCHFLOW_CAPTURE_TOKEN_LOGPROBS=1`. (#922, #926)
+
+### Changed
+- OpenHands supports requested reasoning effort through its LiteLLM request
+  body and now fails closed if completed provider exchanges are missing from
+  trainer trajectories. The built-in OpenCode harness is version-pinned for
+  reproducibility. (#921, #931)
+
+### Fixed
+- Restored the documented `test` → live `integration-light` → internal-preview
+  publication chain for successful `main` pushes, pinned to the exact tested
+  commit and fail-closed against untrusted workflow sources.
+- Fixed OpenHands startup outside root-owned workdirs, OpenCode gateway setup
+  in non-Python task images, Qwen3.5 TRL SFT tokenization, and incomplete agent
+  skill-path validation. (#919, #924, #929, #932)
+- Moved recursive review evidence work and blocking platform probes off the
+  async event loop so concurrent reviews and rollouts retain responsive
+  scheduling and timeouts.
+- Remove staged Docker and Apple Container credential files when live process
+  launch fails before the agent can source and unlink them.
+- Corrected release-facing authentication, sandbox, trajectory-artifact,
+  branching, and provider documentation to match the shipped interfaces.
 
 ## 0.6.5 — 2026-07-10
 

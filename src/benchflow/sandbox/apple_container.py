@@ -292,7 +292,7 @@ class AppleContainerSandbox(BaseSandbox):
         await _RUN_SLOT.acquire()
         self._holds_run_slot = True
         try:
-            _require_kalloc_headroom()
+            await asyncio.to_thread(_require_kalloc_headroom)
             image = await self._resolve_image(force_build=force_build)
             safe_session = re.sub(r"[^a-zA-Z0-9_.-]+", "_", self.session_id)
             self._container_name = f"bf_{safe_session}"[:63]
@@ -414,7 +414,9 @@ class AppleContainerSandbox(BaseSandbox):
         if result.return_code != 0:
             raise RuntimeError(f"{operation} failed: {_failure_output(result)}")
 
-    async def upload_file(self, source_path: Path | str, target_path: str) -> None:
+    async def upload_file(
+        self, source_path: Path | str, target_path: str, *, mode: str | None = None
+    ) -> None:
         source = Path(source_path)
         if not self._container_name:
             raise RuntimeError("Container not started.")
@@ -423,6 +425,8 @@ class AppleContainerSandbox(BaseSandbox):
         if host_path is not None:
             host_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, host_path)
+            if mode is not None:
+                host_path.chmod(int(mode, 8))
             return
 
         target_parent = str(PurePosixPath(target_path).parent)
@@ -438,6 +442,7 @@ class AppleContainerSandbox(BaseSandbox):
             f"{self._container_name}:{target_path}",
             operation="upload_file",
         )
+        await self._apply_upload_mode(target_path, mode)
 
     async def upload_dir(
         self, source_dir: Path | str, target_dir: str, service: str = "main"
