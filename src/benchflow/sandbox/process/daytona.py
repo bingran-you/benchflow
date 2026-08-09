@@ -18,6 +18,7 @@ from benchflow.sandbox.process._base import (
     _ENV_KEY_RE,
     LiveProcess,
     SubprocessLiveProcess,
+    _timeout_sec_from_env,
 )
 
 logger = logging.getLogger(__name__)
@@ -30,32 +31,26 @@ _DAYTONA_SSH_SERVER_ALIVE_COUNT_MAX = 12
 
 
 def _daytona_pty_readline_timeout_sec() -> float:
-    value = os.environ.get(_DAYTONA_PTY_READLINE_TIMEOUT_ENV)
-    if value is None:
-        return _DAYTONA_PTY_READLINE_TIMEOUT_DEFAULT_SEC
-    try:
-        timeout = float(value)
-    except ValueError:
-        logger.warning(
-            "Invalid %s=%r; using default %.0fs",
-            _DAYTONA_PTY_READLINE_TIMEOUT_ENV,
-            value,
-            _DAYTONA_PTY_READLINE_TIMEOUT_DEFAULT_SEC,
-        )
-        return _DAYTONA_PTY_READLINE_TIMEOUT_DEFAULT_SEC
-    if timeout <= 0:
-        return _DAYTONA_PTY_READLINE_TIMEOUT_DEFAULT_SEC
-    return timeout
+    return _timeout_sec_from_env(
+        _DAYTONA_PTY_READLINE_TIMEOUT_ENV,
+        _DAYTONA_PTY_READLINE_TIMEOUT_DEFAULT_SEC,
+    )
 
 
 async def _cleanup_daytona_remote_env_file(
     sandbox: Any,
     remote_env_path: str,
 ) -> None:
+    # timeout=10 is the server-side exec limit; the extra wait_for bounds the
+    # client-side await too, so a dead connection can't hang a teardown path
+    # (this runs inside close()'s finally).
     with contextlib.suppress(Exception):
-        await sandbox.process.exec(
-            f"rm -f {shlex.quote(remote_env_path)}",
-            timeout=10,
+        await asyncio.wait_for(
+            sandbox.process.exec(
+                f"rm -f {shlex.quote(remote_env_path)}",
+                timeout=10,
+            ),
+            timeout=30,
         )
 
 
@@ -655,10 +650,16 @@ class DaytonaPtyProcess(LiveProcess):
         self._closed = True
         try:
             if self._pty:
+                # kill/disconnect go over the PTY's websocket; on a dead or
+                # wedged connection either await can block indefinitely, and a
+                # hung close() freezes the whole rollout teardown (this exact
+                # shape wedged a 25-task job for 11+ hours). Bound each call —
+                # the sandbox is deleted by env.stop() regardless, so an
+                # abandoned server-side PTY session costs nothing.
                 with contextlib.suppress(Exception):
-                    await self._pty.kill()
+                    await asyncio.wait_for(self._pty.kill(), timeout=15)
                 with contextlib.suppress(Exception):
-                    await self._pty.disconnect()
+                    await asyncio.wait_for(self._pty.disconnect(), timeout=15)
                 logger.info("DaytonaPtyProcess terminated")
         finally:
             await self._cleanup_started_env_file()

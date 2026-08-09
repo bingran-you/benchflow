@@ -27,6 +27,7 @@ from rich.markup import escape
 from rich.table import Table
 from rich.text import Text
 
+from benchflow._utils import live_activity
 from benchflow.cli._shared import console
 from benchflow.usage_tracking import is_trusted_usage_source
 
@@ -125,6 +126,52 @@ def _fmt_tokens(n: int) -> str:
     if n >= 1_000:
         return f"{n / 1_000:.1f}k"
     return str(n)
+
+
+# Rollout lifecycle phase (Rollout._phase — the completed phase, except
+# "verifying" which verify() marks at entry) -> what is running now. Shown
+# while the session counters are unavailable — before the agent session
+# exists and after it is torn down — so sandbox create, agent install, and
+# the verifier read as work, not as a hang.
+_PHASE_LABELS = {
+    "created": "creating sandbox…",
+    "setup": "creating sandbox…",
+    "started": "installing agent…",
+    "installed": "running agent…",
+    "connected": "running agent…",
+    "executed": "verifying…",
+    "verifying": "verifying…",
+    "verified": "cleaning up…",
+    "cleaned": "cleaning up…",
+}
+# Unknown phases (e.g. "branched") and pre-register/teardown races: still
+# never blank — a blank cell on a live row reads as a hang.
+_PHASE_FALLBACK = "starting…"
+
+
+def _activity_cell(name: str) -> str:
+    """Per-task activity for the "running now" table, e.g.
+    ``38 calls · last: file_editor``.
+
+    Polls the live rollout's ACP session counters — the same ones the console
+    heartbeat logs, which the Live display otherwise mutes — via the
+    live-activity registry. Until the agent session exists (and after it is
+    closed for the verifier) the cell shows the rollout's lifecycle phase as a
+    label instead, so the row is never blank. Tokens appear only once the
+    session has a usage snapshot (i.e. after a completed prompt).
+    """
+    snap = live_activity.activity(name)
+    if snap is None:
+        return _PHASE_FALLBACK
+    counters = snap.counters
+    if counters is None:
+        return _PHASE_LABELS.get(snap.phase, _PHASE_FALLBACK)
+    cell = f"{counters.tool_calls} calls"
+    if counters.total_tokens:
+        cell += f" · {_fmt_tokens(counters.total_tokens)} tok"
+    if counters.last_tool:
+        cell += f" · last: {counters.last_tool[:30]}"
+    return cell
 
 
 class LiveEvalProgress:
@@ -295,17 +342,23 @@ class LiveEvalProgress:
             )
             tbl.add_column("running now", no_wrap=True)
             tbl.add_column("elapsed", justify="right")
+            tbl.add_column("activity", no_wrap=True)
             now = time.monotonic()
             for name in sorted(running, key=lambda n: running[n])[:_MAX_RUNNING_ROWS]:
                 # Text() so a task name containing Rich markup (`[` is legal in
                 # SkillsBench dir names) is rendered literally, not parsed as
                 # markup — a MarkupError here escapes __rich__ and aborts the
                 # CLI on live-context exit, violating this module's "a render
-                # bug can never perturb a run" contract.
-                tbl.add_row(Text(name), _fmt_dur(now - running[name]))
+                # bug can never perturb a run" contract. Same for the activity
+                # cell, which carries agent-authored tool titles.
+                tbl.add_row(
+                    Text(name),
+                    _fmt_dur(now - running[name]),
+                    Text(_activity_cell(name), style="dim"),
+                )
             extra = len(running) - _MAX_RUNNING_ROWS
             if extra > 0:
-                tbl.add_row(f"… {extra} more", "")
+                tbl.add_row(f"… {extra} more", "", "")
             parts.append(tbl)
 
         # Footer: pass-rate (excl errors) + token/cost economics. Show "—" (not

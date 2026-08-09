@@ -240,9 +240,9 @@ bench eval run --tasks-dir ./tasks --matrix matrix.yaml --trials 3
 | `--agent` | `claude-agent-acp` | Agent name |
 | `--model` | Agent default | Model ID |
 | `--reasoning-effort` | — | Agent reasoning/thinking effort when the agent exposes one (e.g. `max`) |
-| `--sandbox` | `docker` | Sandbox: docker, daytona, or modal |
+| `--sandbox` | `docker` | Sandbox: docker, daytona, modal, apple-container, or agentcore |
 | `--usage-tracking` | `auto` | Token usage telemetry policy: `auto`, `required`, or `off` |
-| `--environment-manifest` | — | Path to an Environment-plane manifest (`environment.toml`); applied to every rollout in the batch |
+| `--environment-manifest` | — | Environment-plane manifest applied to every rollout in the batch: a path to an `environment.toml`, or a `name@version` registry spec resolved via `$BENCHFLOW_ENV_REGISTRY` (see [Environment plane: Registry](../environment-plane.md#registry-nameversion)). Overrides a task.md `benchflow.environment.manifest` pin |
 | `--state` | — | S-axis environment binding; inline JSON, registry `name@version`, or manifest path. Takes precedence over `--environment-manifest` |
 | `--prompt` | task prompt | Prompt to send to the agent; repeatable for multi-prompt runs |
 | `--config-override` | — | C-axis task config overlay; inline JSON/YAML/TOML or `@file`, deep-merged into each task's resolved config |
@@ -252,6 +252,7 @@ bench eval run --tasks-dir ./tasks --matrix matrix.yaml --trials 3
 | `--worker-retries` | `1` | Retry a crashed worker shard this many times, resuming its jobs dir |
 | `--worker-start-stagger-sec` | `1.0` | Seconds to stagger worker starts to avoid Daytona connection storms |
 | `--agent-idle-timeout` | (built-in default) | Abort ACP prompts after this many idle seconds; `0` disables idle detection |
+| `--quiet` | off | Suppress live progress output: the Rich dashboard on a TTY and the per-run console progress heartbeat during agent execution |
 | `--jobs-dir` | `jobs` | Output directory |
 | `--sandbox-user` | `agent` | Sandbox user (null for root) |
 | `--sandbox-setup-timeout` | `120` | Timeout in seconds for sandbox user setup |
@@ -284,6 +285,26 @@ bench eval run --tasks-dir ./tasks --matrix matrix.yaml --trials 3
 
 See [Architecture: skill loading](../architecture.md#skill-loading) for how
 `with-skill` mode is registered with each agent.
+
+While the agent works, a terminal (TTY) shows the live Rich dashboard —
+progress bar, pass/fail counts, and a per-task activity column that tracks
+tool calls/tokens and labels the non-agent stretches (`creating sandbox…`,
+`installing agent…`, `verifying…`); `BENCHFLOW_NO_PROGRESS=1` disables it.
+Plain output (CI, pipes) prints a console progress heartbeat instead: about
+every 45 seconds on single-concurrency runs (`… 6.2min, 12 tool calls
+(last: …)`), auto-gated off for multi-concurrency jobs. Setting
+`BENCHFLOW_PROGRESS=on`/`off` overrides the heartbeat auto-gate; `--quiet`
+is shorthand for setting both `BENCHFLOW_PROGRESS=off` and
+`BENCHFLOW_NO_PROGRESS=1` for the run, silencing dashboard and heartbeat
+alike (so it also wins over an exported `on`). Note that on a TTY,
+`BENCHFLOW_PROGRESS=on` alone produces no heartbeat lines — the dashboard
+mutes INFO logging while it owns the screen; pair it with
+`BENCHFLOW_NO_PROGRESS=1` to get plain heartbeat lines on a TTY.
+
+Set `BENCHFLOW_ACP_HANDSHAKE_TIMEOUT` to a number of seconds (default 60) to
+give slow-starting agents more time to answer the pre-prompt ACP handshake
+(`initialize`/`session_new`) — heavyweight task images can push agent startup
+past the default.
 
 Daytona batch runs collect provider token/cost telemetry by default with a
 sandbox-local LiteLLM gateway. Use `--usage-tracking required` when missing telemetry
@@ -793,6 +814,13 @@ Daytona-backed evals also reap orphaned sandboxes automatically at run start
 an idle-activity guard means concurrent live runs are never reaped). Set
 `BENCHFLOW_DAYTONA_AUTO_REAP` to any of `0`/`false`/`no`/`off` (case-insensitive)
 to disable that automatic pass and rely on the manual command above.
+
+Every rollout attempt also runs under a host-side hard deadline computed from
+the task's own phase budgets — a backstop for awaits wedged below the
+phase-level timeouts (a tripped deadline abandons the sandbox to the
+provider's reaper). Set `BENCHFLOW_ROLLOUT_HARD_DEADLINE` to a number of
+seconds to override the computed value, or to `off`/`none`/`0` to disable the
+backstop.
 
 ## bench environment (deprecated)
 

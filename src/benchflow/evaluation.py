@@ -60,6 +60,7 @@ from benchflow._utils.scoring import (
     VERIFIER_TIMEOUT,
     api_error_is_transient,
     classify_error,
+    classify_score_outcome,
     classify_verifier_error,
     count_audit_outcomes,
     count_score_outcomes,
@@ -574,6 +575,21 @@ class EvaluationConfig:
             )
 
 
+@dataclass(frozen=True)
+class TaskFailure:
+    """Cheap failure evidence for one FAILED (scored, reward != 1) task.
+
+    Carried on :class:`EvaluationResult` so the CLI's final block can print a
+    one-line reason per failed task from data the engine already holds —
+    without re-reading result.json files. Errored tasks are excluded (they
+    already surface through the error counters and warning replay).
+    """
+
+    task_name: str
+    rewards: dict[str, Any] | None
+    verifier_error: str | None
+
+
 @dataclass
 class EvaluationResult:
     """Aggregated results for a job."""
@@ -588,6 +604,7 @@ class EvaluationResult:
     elapsed_sec: float = 0.0
     memory_score: float | None = None
     memory_scores: dict[str, float] = field(default_factory=dict)
+    task_failures: list[TaskFailure] = field(default_factory=list)
 
     @property
     def score(self) -> float:
@@ -1250,7 +1267,20 @@ class Evaluation:
 
             return await run_self_gen(rollout_config)
         rollout = await Rollout.create(rollout_config)
-        return await rollout.run()
+        # Expose the live rollout to the eval dashboard's activity cell —
+        # a same-process poll of the session's heartbeat counters, see
+        # benchflow._utils.live_activity.
+        from benchflow._utils import live_activity
+
+        live_activity.register(task_dir.name, rollout)
+        try:
+            # Rollout.run() enforces its own host-side hard deadline against
+            # awaits wedged below the phase-level timeouts — see
+            # benchflow.rollout._deadline. A trip surfaces here as a normal
+            # infra-retryable error result.
+            return await rollout.run()
+        finally:
+            live_activity.unregister(task_dir.name)
 
     async def _run_single_task_legacy(
         self, task_dir: Path, cfg: EvaluationConfig
@@ -1365,6 +1395,11 @@ class Evaluation:
     ) -> list[tuple[str, RunResult]]:
         """The default schedule — rollouts run concurrently and isolated."""
         cfg = self._config
+        # Console heartbeat auto-gate: interleaved per-task progress lines are
+        # noise at high concurrency, so the sessions' heartbeat defaults off
+        # for multi-concurrency jobs. An explicit BENCHFLOW_PROGRESS=on/off
+        # from the operator always wins (checked first in the session layer).
+        os.environ["BENCHFLOW_PROGRESS_AUTO"] = "1" if cfg.concurrency <= 1 else "0"
         # Floor at 1: Semaphore(0) deadlocks on first acquire. eval-create already
         # rejects <1 at plan time, but this guards every other caller (skills eval,
         # SDK) against a silent forever-hang on a bad concurrency.
@@ -1758,6 +1793,18 @@ class Evaluation:
         score_counts = count_score_outcomes(all_results.values())
         audit_counts = count_audit_outcomes(all_results.values())
         memory, memory_scores = memory_summary(all_results)
+        # Per-task failure evidence for the CLI's final block — FAILED (scored,
+        # reward != 1) tasks only, from data already in memory. Sorted by name
+        # so the printed lines are deterministic across resume/concurrency.
+        task_failures = [
+            TaskFailure(
+                task_name=name,
+                rewards=r.get("rewards"),
+                verifier_error=r.get("verifier_error"),
+            )
+            for name, r in sorted(all_results.items())
+            if classify_score_outcome(r) == "failed"
+        ]
         job_result = EvaluationResult(
             job_name=self._job_name,
             config=cfg,
@@ -1773,6 +1820,7 @@ class Evaluation:
             elapsed_sec=elapsed,
             memory_score=memory["avg_score"],
             memory_scores=memory_scores,
+            task_failures=task_failures,
         )
 
         assert (

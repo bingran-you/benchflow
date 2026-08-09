@@ -17,6 +17,7 @@ compatibility.
 import asyncio
 import json
 import logging
+import os
 from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
@@ -383,6 +384,17 @@ def eval_run(
             ),
         ),
     ] = None,
+    quiet: Annotated[
+        bool,
+        typer.Option(
+            "--quiet",
+            help=(
+                "Suppress live progress output: the Rich dashboard on a TTY "
+                "and the per-run console progress heartbeat (the '… Nmin, K "
+                "tool calls' lines during agent execution)."
+            ),
+        ),
+    ] = False,
     jobs_dir: Annotated[
         str | None,
         typer.Option("--jobs-dir", help="Output directory"),
@@ -582,6 +594,13 @@ def eval_run(
     # a backend was added, so it no longer repeats them.
     """Run an evaluation — single task or batch."""
     _apply_dotenv_to_process_env()
+    if quiet:
+        # Explicit off beats the session layer's auto-gate; see
+        # benchflow.acp.session._console_progress_enabled.
+        os.environ["BENCHFLOW_PROGRESS"] = "off"
+        # --quiet silences ALL live progress: the heartbeat lines above and
+        # the TTY Rich dashboard (see cli._live_progress.progress_enabled).
+        os.environ["BENCHFLOW_NO_PROGRESS"] = "1"
 
     request = EvalCreateRequest(
         config_file=config_file,

@@ -72,6 +72,7 @@ from benchflow._types import Role, Scene, Turn
 # / ``_capture_session_trajectory`` / ``default_rollout_planes`` keep affecting
 # the ``Rollout`` methods that call those names, because those methods stay
 # defined in this module.
+from benchflow._utils.live_activity import ActivitySnapshot, SessionCounters
 from benchflow._utils.scoring import classify_error as classify_error
 from benchflow.acp.types import McpServerSpec
 from benchflow.agents.credentials import upload_credential
@@ -97,6 +98,7 @@ from benchflow.loop_strategies import (
     loop_block,
 )
 from benchflow.models import RolloutResult, TrajectorySource
+from benchflow.rollout import _deadline as _deadline
 from benchflow.rollout._config import GENERATED_SKILLS_ROOT as GENERATED_SKILLS_ROOT
 from benchflow.rollout._config import RolloutConfig as RolloutConfig
 from benchflow.rollout._results import _DIAG_TRUNCATE as _DIAG_TRUNCATE
@@ -753,6 +755,27 @@ class Rollout:
     @property
     def acp_client(self) -> Any:
         return self._acp_client
+
+    def activity_snapshot(self) -> ActivitySnapshot:
+        """The eval dashboard's per-task :class:`ActivitySnapshot`: the
+        current lifecycle phase plus the live :class:`SessionCounters` (tool
+        calls, last tool title, total tokens). ``counters`` is None before
+        the agent session exists — the phase then carries the cell
+        ("creating sandbox…", "verifying…"), so a 90s sandbox create is not
+        indistinguishable from a hang.
+
+        Rollout owns the client/session dig so a rename breaks here — in
+        typed, tested code — instead of silently blanking the dashboard cell
+        (see benchflow._utils.live_activity). Session-factory agents have no
+        ACP client and always report counter-less snapshots.
+        """
+        session = self._acp_client.session if self._acp_client else None
+        if session is None:
+            return ActivitySnapshot(self._phase, None)
+        calls, last_title = session.progress_snapshot()
+        usage = session.latest_usage_totals()
+        tokens = usage.get("total_tokens") if usage else None
+        return ActivitySnapshot(self._phase, SessionCounters(calls, last_title, tokens))
 
     @property
     def trajectory(self) -> list[dict]:
@@ -1719,6 +1742,12 @@ class Rollout:
         """Run the verifier and return rewards."""
         cfg = self._config
 
+        # Mark the phase at entry (the other transitions mark completion):
+        # the verifier can run for minutes after disconnect() reset the phase
+        # to "installed", and the dashboard's activity cell reads _phase to
+        # label that stretch "verifying…" instead of going blank.
+        self._phase = "verifying"
+
         if not self._trajectory and cfg.primary_agent != "oracle":
             scraped = await _scrape_agent_trajectory(
                 self._env, cfg.primary_agent, cfg.sandbox_user
@@ -1977,6 +2006,20 @@ class Rollout:
         logger.error(self._error)
 
     async def run(self) -> RolloutResult:
+        """Run the complete trial lifecycle under a host-side hard deadline.
+
+        The lifecycle itself lives in :meth:`_run_lifecycle`; the deadline is
+        a backstop against awaits wedged below every phase-level timeout (a
+        Daytona PTY kill on a dead websocket, a hung session exec in the
+        post-verify export path) — see :mod:`benchflow.rollout._deadline`.
+        A trip becomes a normal infra-retryable error result and the
+        abandoned attempt's cleanup is bounded too.
+        """
+        return await _deadline.enforce_hard_deadline(
+            self._run_lifecycle(), config=self._config
+        )
+
+    async def _run_lifecycle(self) -> RolloutResult:
         """Run the complete trial lifecycle.
 
         Iterates over effective_scenes. Single-agent is a trial with one
@@ -2386,7 +2429,11 @@ class Rollout:
         TrajectoryWriter(
             self._rollout_dir / "trajectory" / "acp_trajectory.jsonl"
         ).write_final(self._trajectory)
-        logger.warning(
+        # info, not warning: trajectory repair is evidence-mutation an auditor
+        # should find at default (non-TTY/CI) verbosity, but as a warning it
+        # survived the live dashboard's WARNING+ replay and printed between
+        # teardown and the score line (dogfood 2026-08-09).
+        logger.info(
             "Repaired %d lossy ACP tool event(s) from trusted provider capture",
             repaired,
         )
