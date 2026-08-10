@@ -64,6 +64,7 @@ from benchflow._utils.scoring import (
     classify_verifier_error,
     count_audit_outcomes,
     count_score_outcomes,
+    mean_scored_reward,
     pass_rate,
     pass_rate_excl_errors,
 )
@@ -588,6 +589,10 @@ class TaskFailure:
     task_name: str
     rewards: dict[str, Any] | None
     verifier_error: str | None
+    # The task's rollout dir name under the job dir (``<task>__<uuid8>``), so
+    # the CLI can find the rollout's verifier artifacts without guessing.
+    # None on results persisted before the key existed.
+    rollout_name: str | None = None
 
 
 @dataclass
@@ -605,6 +610,10 @@ class EvaluationResult:
     memory_score: float | None = None
     memory_scores: dict[str, float] = field(default_factory=dict)
     task_failures: list[TaskFailure] = field(default_factory=list)
+    # Mean of rewards over scored rollouts (None when nothing scored). The
+    # pass/fail counts binarize at reward==1, which erases partial credit —
+    # a 0.3 rubric score and a flat 0 both print as FAIL without this.
+    mean_reward: float | None = None
 
     @property
     def score(self) -> float:
@@ -1387,7 +1396,16 @@ class Evaluation:
         status = "PASS" if reward == 1 else ("FAIL" if reward is not None else "ERR")
         err_msg = result.error or result.verifier_error
         err = f" ({truncate_end(err_msg, 50)})" if err_msg else ""
-        logger.info(f"[{status}] {td.name} (tools={result.n_tool_calls}){err}")
+        # Show the fractional reward on scored lines: pass/fail binarizes at
+        # reward==1, so without it a 0.3 rubric score reads as a flat 0.
+        reward_part = (
+            f"reward={reward:.2f}, "
+            if isinstance(reward, (int, float)) and not isinstance(reward, bool)
+            else ""
+        )
+        logger.info(
+            f"[{status}] {td.name} ({reward_part}tools={result.n_tool_calls}){err}"
+        )
         self._fire_progress(self._on_result, td.name, result)
 
     async def _run_parallel_independent(
@@ -1801,6 +1819,9 @@ class Evaluation:
                 task_name=name,
                 rewards=r.get("rewards"),
                 verifier_error=r.get("verifier_error"),
+                # `or None`: RolloutResult defaults rollout_name to "" — don't
+                # let that masquerade as a resolvable rollout dir.
+                rollout_name=r.get("rollout_name") or None,
             )
             for name, r in sorted(all_results.items())
             if classify_score_outcome(r) == "failed"
@@ -1821,6 +1842,7 @@ class Evaluation:
             memory_score=memory["avg_score"],
             memory_scores=memory_scores,
             task_failures=task_failures,
+            mean_reward=mean_scored_reward(all_results.values()),
         )
 
         assert (
@@ -1878,6 +1900,7 @@ class Evaluation:
             "score_excl_errors_ratio": pass_rate_excl_errors(
                 passed=audit_counts["passed"], failed=audit_counts["failed"]
             ),
+            "mean_reward": job_result.mean_reward,
             "elapsed_sec": elapsed,
             "memory_score": job_result.memory_score,
             "memory_score_coverage": (
@@ -1977,9 +2000,14 @@ class Evaluation:
                     "This likely indicates a systemic verifier bug, not agent failure."
                 )
 
+        mean_part = (
+            f"mean_reward={job_result.mean_reward:.2f}, "
+            if job_result.mean_reward is not None
+            else ""
+        )
         logger.info(
             f"Job complete: {job_result.passed}/{job_result.total} "
-            f"({job_result.score:.1%}), errors={job_result.errored}, "
+            f"({job_result.score:.1%}), {mean_part}errors={job_result.errored}, "
             f"idle_timeouts={error_category_counts.get(IDLE_TIMEOUT, 0)}, "
             f"time={elapsed / 60:.1f}min"
         )

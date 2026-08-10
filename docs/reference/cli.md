@@ -242,7 +242,7 @@ bench eval run --tasks-dir ./tasks --matrix matrix.yaml --trials 3
 | `--reasoning-effort` | — | Agent reasoning/thinking effort when the agent exposes one (e.g. `max`) |
 | `--sandbox` | `docker` | Sandbox: docker, daytona, modal, apple-container, or agentcore |
 | `--usage-tracking` | `auto` | Token usage telemetry policy: `auto`, `required`, or `off` |
-| `--environment-manifest` | — | Environment-plane manifest applied to every rollout in the batch: a path to an `environment.toml`, or a `name@version` registry spec resolved via `$BENCHFLOW_ENV_REGISTRY` (see [Environment plane: Registry](../environment-plane.md#registry-nameversion)). Overrides a task.md `benchflow.environment.manifest` pin |
+| `--environment-manifest` | — | Environment-plane manifest applied to every rollout in the batch: a path to an `environment.toml`, or a `name@version` registry spec resolved via `$BENCHFLOW_ENV_REGISTRY` when set, else the built-in registry shipped with benchflow (`env0@prod`, `env0@outage`; see [Environment plane: Registry](../environment-plane.md#registry-nameversion)). Overrides a task.md `benchflow.environment.manifest` pin |
 | `--state` | — | S-axis environment binding; inline JSON, registry `name@version`, or manifest path. Takes precedence over `--environment-manifest` |
 | `--prompt` | task prompt | Prompt to send to the agent; repeatable for multi-prompt runs |
 | `--config-override` | — | C-axis task config overlay; inline JSON/YAML/TOML or `@file`, deep-merged into each task's resolved config |
@@ -300,6 +300,30 @@ alike (so it also wins over an exported `on`). Note that on a TTY,
 `BENCHFLOW_PROGRESS=on` alone produces no heartbeat lines — the dashboard
 mutes INFO logging while it owns the screen; pair it with
 `BENCHFLOW_NO_PROGRESS=1` to get plain heartbeat lines on a TTY.
+
+The dashboard footer also carries a live token total: completed tasks'
+trusted telemetry plus every running rollout's live usage (ACP session
+counters reconciled with the sandbox gateway's live capture), so spend is
+visible mid-run. The live figure is a lower bound — it trails the gateway
+log by however much the capture has yet to read — and if that tail ever
+stops advancing altogether, the run logs one `Live token counter has
+stalled` warning so a stale number is never passed off as a current one.
+Cost stays completed-tasks-only — `$` comes from the gateway log imported
+at scoring time.
+
+After the run, each failed task gets one dim `✗ task: reason` line —
+verifier error first, else a compact reward/metric breakdown, else the
+scored reward, upgraded from small on-disk verifier artifacts (the CTRF
+report, `reward.json`, or a `test-stdout.txt` tail) when the in-memory
+reason is a bare reward. Multi-failure CTRF reports roll up as
+`(+N more failure(s); P/T checks passed)`, and a dim
+`(details: …/verifier)` pointer names the artifact directory whenever one
+exists on disk.
+
+The final `Score: P/T (…%)` line is pass-threshold aggregation — a task counts
+as passed only at reward 1.0 — while `mean reward` beside it is the average raw
+verifier reward, so `0/1 (0.0%)` next to `mean reward 0.80` means partial
+credit below the pass threshold, not a flat zero.
 
 Set `BENCHFLOW_ACP_HANDSHAKE_TIMEOUT` to a number of seconds (default 60) to
 give slow-starting agents more time to answer the pre-prompt ACP handshake

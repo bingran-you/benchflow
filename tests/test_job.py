@@ -101,6 +101,23 @@ class TestRetryConfig:
         cfg = RetryConfig()
         assert cfg.should_retry("Failed to get session command: ")
 
+    def test_should_retry_stamped_transient_sandbox_transport_failure(self):
+        """The stamped marker must stay retryable through outer wrapping.
+
+        Every provider call on the sandbox corridor — exec, upload, download,
+        stat — funnels its transport blips into one marker at the raise site.
+        The message it lands in is whatever the caller wraps it with, so the
+        retry verdict has to survive that wrapping; a proxy-start failure is
+        the case that motivated it.
+        """
+        cfg = RetryConfig()
+        assert cfg.should_retry(
+            "LiteLLM proxy failed to start for model 'deepseek/deepseek-v4-flash': "
+            "TransientSandboxTransportError: transient sandbox transport failure: "
+            "DaytonaTimeoutError: Failed to execute session command: (no detail). "
+            "BenchFlow never sends provider traffic directly, so this is fatal."
+        )
+
     def test_should_retry_sandbox_startup_failure(self):
         """Sandbox setup diagnostics are infra failures for retry purposes."""
         cfg = RetryConfig()
@@ -630,6 +647,7 @@ class TestJobRunOrchestration:
             "task-0": RunResult(task_name="task-0", rewards={"reward": 1.0}),
             "task-1": RunResult(
                 task_name="task-1",
+                rollout_name="task-1__ab12cd34",
                 rewards={"reward": 0.5, "decisions_found": 0.0},
                 verifier_error=None,
             ),
@@ -644,13 +662,67 @@ class TestJobRunOrchestration:
 
         result = await job.run()
 
+        # rollout_name rides along (via rollout_result_payload) so the CLI can
+        # resolve the rollout's artifact dir exactly, without globbing.
         assert result.task_failures == [
             TaskFailure(
                 task_name="task-1",
                 rewards={"reward": 0.5, "decisions_found": 0.0},
                 verifier_error=None,
+                rollout_name="task-1__ab12cd34",
             )
         ]
+
+    @pytest.mark.asyncio
+    async def test_run_computes_mean_reward_and_logs_fractional_rewards(
+        self, tmp_path, caplog
+    ):
+        """Partial credit must survive the binarized pass/fail view: run()
+        computes mean_reward over scored rollouts (errors excluded, not
+        zeroed), the per-task lines carry reward=, error lines don't, and the
+        job-complete line carries mean_reward=.
+        """
+        job = self._make_job(tmp_path, n_tasks=3, concurrency=1)
+        outcomes = {
+            "task-0": RunResult(task_name="task-0", rewards={"reward": 1.0}),
+            "task-1": RunResult(task_name="task-1", rewards={"reward": 0.3}),
+            "task-2": RunResult(task_name="task-2", error="agent crashed"),
+        }
+
+        async def fake_run(*, task_path, **kwargs):
+            return outcomes[task_path.name]
+
+        job._sdk = AsyncMock()
+        job._sdk.run = AsyncMock(side_effect=fake_run)
+
+        with caplog.at_level(logging.INFO, logger="benchflow.evaluation"):
+            result = await job.run()
+
+        assert result.mean_reward == pytest.approx(0.65)
+        assert "[PASS] task-0 (reward=1.00, tools=0)" in caplog.text
+        assert "[FAIL] task-1 (reward=0.30, tools=0)" in caplog.text
+        assert "[ERR] task-2 (tools=0)" in caplog.text
+        assert "mean_reward=0.65" in caplog.text
+        # The machine-readable surface must agree with the console.
+        summary = json.loads((job._jobs_dir / "summary.json").read_text())
+        assert summary["mean_reward"] == pytest.approx(0.65)
+
+    @pytest.mark.asyncio
+    async def test_run_mean_reward_none_when_nothing_scored(self, tmp_path, caplog):
+        """An all-error job has no scored rollouts: mean_reward must be None
+        and the job-complete line must omit the field (a fabricated 0.00 would
+        read as a real capability result)."""
+        job = self._make_job(tmp_path, n_tasks=1, concurrency=1)
+        job._sdk = AsyncMock()
+        job._sdk.run = AsyncMock(
+            return_value=RunResult(task_name="task-0", error="agent crashed")
+        )
+
+        with caplog.at_level(logging.INFO, logger="benchflow.evaluation"):
+            result = await job.run()
+
+        assert result.mean_reward is None
+        assert "mean_reward=" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_error_and_verifier_error_does_not_crash_invariant(self, tmp_path):

@@ -18,13 +18,19 @@ from typing import Any, NamedTuple
 class SessionCounters(NamedTuple):
     """The live ACP session counters the console heartbeat logs.
 
-    ``total_tokens`` is None until the session has a usage snapshot (i.e.
-    after a completed prompt).
+    ``total_tokens`` is None until a live usage signal exists: the producer
+    (``Rollout.activity_snapshot``) fills it with max(ACP prompt-completion
+    snapshot, LiteLLM gateway live-capture total), so it becomes non-None as
+    soon as the gateway has mirrored a usage-bearing record — mid-prompt —
+    even when no ACP prompt has completed yet. ``distinct_tools`` counts
+    distinct tool display titles seen this session; None means unknown, which
+    renderers treat like varied (keep the ``last:`` cell).
     """
 
     tool_calls: int
     last_tool: str
     total_tokens: int | None
+    distinct_tools: int | None = None
 
 
 class ActivitySnapshot(NamedTuple):

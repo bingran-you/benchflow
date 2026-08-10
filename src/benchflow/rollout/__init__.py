@@ -74,6 +74,7 @@ from benchflow._types import Role, Scene, Turn
 # defined in this module.
 from benchflow._utils.live_activity import ActivitySnapshot, SessionCounters
 from benchflow._utils.scoring import classify_error as classify_error
+from benchflow._utils.text import describe_exception
 from benchflow.acp.types import McpServerSpec
 from benchflow.agents.credentials import upload_credential
 from benchflow.agents.registry import AGENTS
@@ -228,6 +229,12 @@ from benchflow.usage_tracking import (
 logger = logging.getLogger(__name__)
 _SETUP_COMMAND_LOCK_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
+# Lifecycle phases from verify() onward. The agent will not run again in this
+# rollout once one of these is set, so nothing may rewind ``_phase`` out of
+# them — the live dashboard renders the phase as a label and a backwards step
+# reads as the run having restarted (see disconnect()).
+_TERMINAL_PHASES = frozenset({"verifying", "verified", "cleaned"})
+
 
 _MCP_TRANSPORT_TO_ACP_TYPE = {
     "stdio": "stdio",
@@ -237,7 +244,7 @@ _MCP_TRANSPORT_TO_ACP_TYPE = {
 
 
 def _task_mcp_specs(task: Any) -> list[McpServerSpec]:
-    """Map the task's ``[[environment.mcp_servers]]`` entries to ACP specs.
+    """Map the task's ``[[sandbox.mcp_servers]]`` entries to ACP specs.
 
     This is the composition seam between the task-config layer
     (``MCPServerConfig``) and the ACP protocol layer (``McpServerSpec``) — kept
@@ -247,7 +254,7 @@ def _task_mcp_specs(task: Any) -> list[McpServerSpec]:
     — reachable by the agent. Returns ``[]`` when the task declares none,
     preserving the historical default of attaching no MCP servers.
     """
-    env_config = getattr(getattr(task, "config", None), "environment", None)
+    env_config = getattr(getattr(task, "config", None), "sandbox", None)
     configs = getattr(env_config, "mcp_servers", None) or []
     return [
         McpServerSpec(
@@ -503,7 +510,7 @@ async def _run_one_environment_setup_command(
 async def _run_environment_setup_commands(env: Any, task: Any) -> None:
     """Run task-authored setup commands after sandbox start, before agent install."""
 
-    env_config = getattr(getattr(task, "config", None), "environment", None)
+    env_config = getattr(getattr(task, "config", None), "sandbox", None)
     commands = list(getattr(env_config, "setup_commands", []) or [])
     if not commands:
         return
@@ -539,7 +546,7 @@ async def _run_environment_setup_commands(env: Any, task: Any) -> None:
 async def _run_environment_healthcheck(env: Any, task: Any) -> None:
     """Gate rollout startup on the task-authored environment healthcheck."""
 
-    env_config = getattr(getattr(task, "config", None), "environment", None)
+    env_config = getattr(getattr(task, "config", None), "sandbox", None)
     healthcheck = getattr(env_config, "healthcheck", None)
     if healthcheck is None:
         return
@@ -579,6 +586,43 @@ async def _run_environment_healthcheck(env: Any, task: Any) -> None:
             delay = min(healthcheck.start_interval_sec, start_deadline - now)
         if delay > 0:
             await asyncio.sleep(delay)
+
+
+def _gateway_live_tokens(runtime: Any) -> int | None:
+    """Cumulative provider tokens from the LiteLLM gateway's live capture.
+
+    Piggybacks on the llm_trajectory.jsonl mirror the proxy runtime already
+    runs for every rollout (``LiteLLMProcess.start_live_capture``, wired in
+    ``connect()`` and cancelled by the proxy's ``stop()`` in cleanup) — this
+    read generates no additional sandbox exec traffic, at any concurrency.
+
+    ``runtime`` stays ``Any`` because the rollout kernel must not import the
+    concrete provider plane (``benchflow.providers.runtime``; the #515
+    architecture test forbids even a TYPE_CHECKING import, and the planes
+    contract is deliberately Any-typed). Rename-safety for the
+    ``server.live_usage_tokens`` accessor lives where typing IS allowed: the
+    name is agreed in ``contracts.planes.LiveUsageGateway``, LiteLLMProcess
+    statically asserts conformance in the providers plane
+    (``_live_usage_gateway_conformance`` — a rename on either side fails
+    ty), and ``test_gateway_live_tokens_reach_rollout_activity_snapshot``
+    pins THIS call site to the real classes end-to-end (a drift here fails
+    pytest). The attribute access is direct (no getattr default) so the
+    failure mode under a fake without the accessor is the caught exception
+    below, not a permanent silent None.
+    Best-effort by the dashboard contract: any absence (no runtime, no
+    server, the accessor raising, a non-int value) degrades to None —
+    #963's ACP-only behavior — never to a render error.
+    """
+    if runtime is None:
+        return None
+    try:
+        server = runtime.server
+        if server is None:
+            return None
+        tokens = server.live_usage_tokens()
+    except Exception:
+        return None
+    return tokens if isinstance(tokens, int) else None
 
 
 class Rollout:
@@ -759,23 +803,48 @@ class Rollout:
     def activity_snapshot(self) -> ActivitySnapshot:
         """The eval dashboard's per-task :class:`ActivitySnapshot`: the
         current lifecycle phase plus the live :class:`SessionCounters` (tool
-        calls, last tool title, total tokens). ``counters`` is None before
+        calls, last tool title, total tokens, distinct tool titles).
+        ``counters`` is None before
         the agent session exists — the phase then carries the cell
         ("creating sandbox…", "verifying…"), so a 90s sandbox create is not
         indistinguishable from a hang.
 
+        ``total_tokens`` reconciles two cumulative live signals as
+        ``max(acp_snapshot, gateway_live)``: the ACP session's self-reported
+        usage (updates only when a *prompt* completes — a single-prompt
+        rollout stays None for the whole agent phase) and the LiteLLM
+        gateway's live callback capture (updates per completed LLM *request*,
+        mid-prompt). max() because both inputs are non-decreasing counters, so
+        the cell/footer never step down mid-run whichever signal leads —
+        gateway-live can exceed the ACP self-report (requests the agent
+        discarded, cache accounting) and vice versa (capture lag behind large
+        log records) — and a dead gateway signal (None) degrades to exactly
+        the ACP-only behavior. The winner is display-only: at completion the
+        trusted scoring total replaces it (see the footer contract in
+        cli/_live_progress.py for the sanctioned non-monotonic boundary).
+
         Rollout owns the client/session dig so a rename breaks here — in
         typed, tested code — instead of silently blanking the dashboard cell
         (see benchflow._utils.live_activity). Session-factory agents have no
-        ACP client and always report counter-less snapshots.
+        ACP client and always report counter-less snapshots (their
+        gateway-live tokens are not surfaced — the counters seam is the only
+        token carrier).
         """
         session = self._acp_client.session if self._acp_client else None
         if session is None:
             return ActivitySnapshot(self._phase, None)
         calls, last_title = session.progress_snapshot()
         usage = session.latest_usage_totals()
-        tokens = usage.get("total_tokens") if usage else None
-        return ActivitySnapshot(self._phase, SessionCounters(calls, last_title, tokens))
+        acp_tokens = usage.get("total_tokens") if usage else None
+        gateway_tokens = _gateway_live_tokens(self._usage_runtime)
+        if acp_tokens is None and gateway_tokens is None:
+            tokens = None
+        else:
+            tokens = max(acp_tokens or 0, gateway_tokens or 0)
+        return ActivitySnapshot(
+            self._phase,
+            SessionCounters(calls, last_title, tokens, session.distinct_tool_titles),
+        )
 
     @property
     def trajectory(self) -> list[dict]:
@@ -889,7 +958,7 @@ class Rollout:
             ),
             disallow=self._disallow_web_tools,
         )
-        env_config = getattr(getattr(self._task, "config", None), "environment", None)
+        env_config = getattr(getattr(self._task, "config", None), "sandbox", None)
         task_skill_policy = resolve_task_skill_policy(
             task_path=cfg.task_path,
             skill_mode=cfg.recorded_skill_mode,
@@ -1322,7 +1391,16 @@ class Rollout:
         self._active_role = None
         self._session_tool_count = 0
         self._session_traj_count = 0
-        self._phase = "installed"
+        # Rewinding the phase to "installed" is right for the between-scenes
+        # disconnect (another agent turn follows, and connect_as() will mark
+        # "connected"), but disconnect() is ALSO called from cleanup(), after
+        # verify() has already moved the rollout into its terminal phases. Left
+        # unguarded, that rewind made the live dashboard walk backwards —
+        # "verifying…" and then "running agent…" again for the whole teardown
+        # stretch — and briefly blanked ``Rollout.result``, which is gated on
+        # the same terminal phases.
+        if getattr(self, "_phase", None) not in _TERMINAL_PHASES:
+            self._phase = "installed"
 
     def on_ask_user(self, handler: Any) -> None:
         """Register the agent-initiated ``session/request_permission`` handler.
@@ -2115,7 +2193,12 @@ class Rollout:
             self._error = str(e)
             logger.error(str(e))
         except Exception as e:
-            self._error = str(e)
+            # describe_exception, not str(e): this is the funnel every
+            # unclassified rollout failure lands in, and some SDK errors
+            # stringify to a bare wrapper prefix with no detail behind it.
+            # Persisting those raw leaves an artifact that names neither what
+            # failed nor that the detail was empty.
+            self._error = describe_exception(e)
             logger.error("Run failed", exc_info=True)
         finally:
             await self.cleanup()

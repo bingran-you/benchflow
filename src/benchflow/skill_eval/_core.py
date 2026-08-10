@@ -19,7 +19,6 @@ from string import Template
 from typing import Any, Literal
 
 import tomli_w
-import yaml
 
 from benchflow._paths import assert_within, safe_path_segment
 from benchflow.skill_policy import (
@@ -27,7 +26,7 @@ from benchflow.skill_policy import (
     SKILL_MODE_WITH_SKILL,
     validate_container_mount_path,
 )
-from benchflow.task.document import render_task_md
+from benchflow.task.document import dump_frontmatter_yaml, render_task_md
 
 from .schema import DEFAULT_SKILL_MOUNT_DIR, validate_evals_json
 
@@ -263,24 +262,24 @@ def _build_task_toml(dataset: EvalDataset, case: EvalCase, with_skill: bool) -> 
     if present_judge_keys:
         verifier["env"] = {k: f"${{{k}}}" for k in present_judge_keys}
 
-    environment_block: dict[str, Any] = {
+    sandbox_block: dict[str, Any] = {
         "cpus": 1,
         "memory_mb": 2048,
         "allow_internet": True,
     }
     if with_skill:
-        environment_block["skills_dir"] = dataset.skill_mount_dir
+        sandbox_block["skills_dir"] = dataset.skill_mount_dir
     # Forward per-case ``environment`` overrides (#392). The runner reads
-    # ``[environment.env]`` and forwards entries to the sandbox.
+    # ``[sandbox.env]`` and forwards entries to the sandbox.
     if case.environment:
-        environment_block["env"] = dict(case.environment)
+        sandbox_block["env"] = dict(case.environment)
 
     doc: dict[str, Any] = {
         "version": "1.0",
         "metadata": metadata,
         "agent": {"timeout_sec": dataset.timeout_sec},
         "verifier": verifier,
-        "environment": environment_block,
+        "sandbox": sandbox_block,
     }
 
     return tomli_w.dumps(doc)
@@ -314,7 +313,7 @@ def _build_verifier_md(dataset: EvalDataset, case: EvalCase) -> str:
             },
         },
     }
-    rendered_frontmatter = yaml.safe_dump(frontmatter, sort_keys=False)
+    rendered_frontmatter = dump_frontmatter_yaml(frontmatter)
     return (
         f"---\n{rendered_frontmatter}---\n\n## role:reviewer\n\n"
         "Judge whether the agent trajectory satisfies the case-specific "

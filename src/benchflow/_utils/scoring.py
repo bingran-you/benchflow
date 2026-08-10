@@ -1,9 +1,13 @@
 """Pure scoring and classification helpers — no external dependencies."""
 
+import math
 from collections.abc import Iterable, Mapping
 from typing import Any, Literal
 
-from benchflow.diagnostics import DIAGNOSTIC_REASON_IDLE_TIMEOUT
+from benchflow.diagnostics import (
+    DIAGNOSTIC_REASON_IDLE_TIMEOUT,
+    TRANSIENT_SANDBOX_TRANSPORT_MARKER,
+)
 
 # Error category constants
 INSTALL_FAILED = "install_failure"
@@ -173,6 +177,14 @@ def _looks_like_infra_error(error: str) -> bool:
             "connection reset",
             "connection refused",
             "broken pipe",
+            # Stamped by TransientSandboxTransportError at the sandbox-SDK
+            # boundary, where the vendor exception type is still available to
+            # judge. One marker covers every provider call — exec, upload,
+            # download, stat — instead of one entry per vendor message
+            # prefix, which would be endless and silently incomplete.
+            TRANSIENT_SANDBOX_TRANSPORT_MARKER,
+            # Predates the marker above and is kept for strings rebuilt
+            # outside that boundary (e.g. a verifier error re-raised as text).
             "failed to get session command",
             "sandbox not found",
             "workspace not found",
@@ -341,6 +353,26 @@ def count_audit_outcomes(results: Iterable[Mapping[str, Any]]) -> dict[str, int]
 def count_result_outcomes(results: Iterable[Mapping[str, Any]]) -> dict[str, int]:
     """Backward-compatible alias for audit/reporting outcome accounting."""
     return count_audit_outcomes(results)
+
+
+def mean_scored_reward(results: Iterable[Mapping[str, Any]]) -> float | None:
+    """Mean reward over scored rollouts, or None when nothing scored.
+
+    A rollout is scored when ``rewards.reward`` is a finite numeric value.
+    Bools are excluded — ``classify_result`` treats a persisted ``true`` as a
+    pass (``True == 1``), but a bool is not a reward magnitude — and so are
+    non-finite values, which the resume path can feed in unvalidated (Python's
+    ``json`` round-trips NaN). Errored rollouts (reward None) are excluded,
+    not zeroed: a mean diluted by infra errors would misread as capability.
+    """
+    scored = [
+        rw
+        for r in results
+        if isinstance(rw := extract_reward(r), (int, float))
+        and not isinstance(rw, bool)
+        and math.isfinite(rw)
+    ]
+    return sum(scored) / len(scored) if scored else None
 
 
 def pass_rate(*, passed: int, total: int) -> float:
