@@ -13,31 +13,82 @@
 
 BenchFlow is a universal environment framework: it runs AI agents against task environments and scores them through one hardened contract. **A benchmark is just a frozen environment** — point BenchFlow at any of them, drive it with *any* ACP agent, and run single-agent, multi-agent, or multi-round patterns over the same Scene-based lifecycle.
 
-- **Run any benchmark** — three-layer routing runs supported frameworks natively, translates unknown formats and proves equivalence with a parity gate, or runs a bespoke harness as-is; every layer emits one scored-trajectory contract. See [Run any benchmark](./docs/running-any-benchmark.md)
-- **Any ACP agent** — Gemini CLI, Claude Code, Codex, OpenCode, OpenHands, Pi, or your own
-- **Single + multi + progressive** — single-agent / multi-agent (coder + reviewer, simulated user) / multi-round with a Python `BaseUser` callback
-- **Loop strategies** — wrap any agent in a `--loop-strategy` (`verify-retry`, `self-review`); every rollout captures a per-iteration reward + token trajectory, so you can plot capability against cost (can a cheap model + loops match an expensive one at equal token spend?)
-- **`task.md` tasks** — one file (YAML frontmatter + prompt body) replaces the split `task.toml` + `instruction.md` layout; author with `bench tasks init` / `check` / `migrate` / `export`
-- **Hosted environments** — run external PrimeIntellect / Verifiers environments through `--source-env`, without converting them to BenchFlow tasks
-- **Sandboxes** — Docker locally, Apple Container on Apple Silicon Macs, Daytona for parallel cloud runs (orphaned sandboxes auto-reaped at eval start), Modal for serverless/GPU-backed task environments, and AgentCore for AWS-hosted runtimes
-- **Hardened verifier** — defaults block BenchJack/Meerkat-style reward-hacking; tasks opt out per-feature
-- **Training-ready output** — scored rollouts emit a Verifiers/ORS reward record and best-effort ATIF (`trainer/atif.json`) / ADP (`trainer/adp.jsonl`) conversions; ATIF is omitted when the trajectory is empty, and conversion errors are reported in the rollout result
+## Qucik start: 1. Upload a trajectory
 
-## Quickstart
+For local Claude Code or Codex jsonl formatted trajectory files that you are proud of (contain challenging tasks you dealed with via chatting to agents), you can upload that file to BenchFlow to join the competition for winning $2,000 cash reward. No BenchFlow account, credentials, or API key is required:
 
 ```bash
-# Install or upgrade to the latest stable BenchFlow CLI
+# Install or upgrade BenchFlow
 uv tool install --python 3.12 --upgrade benchflow
 
-# Run a benchmark: any task source, any ACP agent, any sandbox
-export GEMINI_API_KEY=...            # or claude auth login / codex login for subscription auth
-bench eval run \
-    --source-repo benchflow-ai/skillsbench --source-path tasks \
-    --agent gemini --model gemini-3.1-flash-lite-preview \
-    --sandbox docker
+# Interactive upload (prompts for path, GitHub ID, then email)
+bench traj upload
+
+# Or provide every input up front
+bench traj upload /absolute/path/to/trial \
+  --github-id YOUR_GITHUB_ID \
+  --email YOU@example.com
 ```
 
-Each run writes a per-task `result.json` (rewards, trajectory summary, and token usage), full events under `trajectory/`, and a job `summary.json` (pass-rate, cost, and — for looped runs — a pass@iteration convergence curve). New here? Start with [Getting started](./docs/getting-started.md), or paste the [agent quickstart prompt](./docs/agent-quickstart.md) into Claude Code / Codex / Gemini CLI and let it drive the whole thing.
+The path may be a trial directory, a directory of JSONL files, or one JSONL
+file. Path and contributor details are required inputs; any that are omitted are
+prompted for interactively. Detected secret values are replaced locally with
+`<XXX-benchflow-key-values-XXX>` before upload. Contributor details are stored
+in `manifest.json`. After the path is entered, the CLI shows a redacted preview
+and a trajectory report with partitioned human, thinking, and tool-call counts,
+creation time, file size, and the number of masked key values. Interactive users
+confirm the report before a byte-progress display starts the upload. The full
+redacted report is retained in the uploaded `manifest.json`.
+See the concise [upload skill](./.agents/skills/benchflow-traj-upload/SKILL.md)
+or the [trajectory upload guide](./docs/traj-upload.md).
+
+## Qucik start: 2. Run with a ChatGPT or Claude subscription
+
+No OpenAI or Anthropic API key is required. Start Docker, install BenchFlow,
+then run **one** of these options. BenchFlow detects the saved host login and
+makes it available to the agent inside the sandbox.
+
+```bash
+uv tool install --python 3.12 --upgrade benchflow
+docker info >/dev/null  # Docker must be running
+```
+
+### ChatGPT subscription via Codex
+
+Install the [Codex CLI](https://github.com/openai/codex), then:
+
+```bash
+codex login
+unset OPENAI_API_KEY CODEX_API_KEY  # ensure subscription auth is used
+
+bench eval run \
+  --source-repo benchflow-ai/skillsbench \
+  --source-path tasks/citation-check \
+  --agent codex \
+  --model gpt-5.5 \
+  --sandbox docker
+```
+
+### Claude subscription via Claude Code
+
+Install [Claude Code](https://code.claude.com/docs/en/quickstart), then:
+
+```bash
+claude auth login
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN  # ensure subscription auth is used
+
+bench eval run \
+  --source-repo benchflow-ai/skillsbench \
+  --source-path tasks/citation-check \
+  --agent claude \
+  --model claude-sonnet-4-6 \
+  --sandbox docker
+```
+
+The agent may pass or fail the benchmark task; either result means the
+evaluation completed. Each run writes rewards, token usage, and the full
+trajectory under `jobs/`. See [Getting started](./docs/getting-started.md) for
+other agents, models, and sandboxes.
 
 ## Install
 
@@ -81,6 +132,7 @@ Start with [Getting started](./docs/getting-started.md), then [Concepts](./docs/
 | Multi-agent: coder + reviewer, simulated user, BYOS, stateful envs | [Use cases](./docs/use-cases.md) |
 | Multi-round single-agent (progressive disclosure, oracle access) | [Progressive disclosure](./docs/progressive-disclosure.md) |
 | Skill evaluation (when the artifact is a skill, not a workspace) | [Skill eval](./docs/skill-eval.md) |
+| Contribute a trajectory capture | [Trajectory upload](./docs/traj-upload.md) |
 | Understand the security model | [Sandbox hardening](./docs/sandbox-hardening.md) |
 | Use public vs internal preview SDK releases | [Release channels](./docs/release.md) |
 | CLI flags + commands | [CLI reference](./docs/reference/cli.md) |
