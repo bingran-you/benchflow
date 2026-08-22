@@ -13,36 +13,54 @@
 
 BenchFlow is a universal environment framework: it runs AI agents against task environments and scores them through one hardened contract. **A benchmark is just a frozen environment** — point BenchFlow at any of them, drive it with *any* ACP agent, and run single-agent, multi-agent, or multi-round patterns over the same Scene-based lifecycle.
 
-## Qucik start: 1. Upload a trajectory
+## Quick start: 1. Submit a trajectory
 
-For local Claude Code or Codex jsonl formatted trajectory files that you are proud of (contain challenging tasks you dealed with via chatting to agents), you can upload that file to BenchFlow to join the competition for winning $2,000 cash reward. No BenchFlow account, credentials, or API key is required:
+**Send these to your coding agent.** Copy
+the block below and paste it as a message to Claude Code, Codex, OpenCode, or
+Cursor. That is the $2,000 eval prize path. No BenchFlow account, API key, or
+Azure login.
+
+> Submit my relevant local Claude Code, Codex, OpenCode, or Cursor session from the re:Agent e2e agentic science / ai4bio hackathon (last 72 hours, on this laptop) to the BenchFlow eval prize.
+>
+> 1. First make sure the latest benchflow CLI is installed: uv tool install --python 3.12 --upgrade --force benchflow
+>
+> 2. Then read https://raw.githubusercontent.com/benchflow-ai/benchflow/main/.agents/skills/benchflow-traj-upload/SKILL.md and follow it: find a session, open the viewer, and upload only after I (the human) review it.
+
+The agent finds sessions on this machine, opens the viewer, and uploads after
+you like what you see.
+
+The prompt has the agent install the latest BenchFlow first (`uv tool
+install --python 3.12 --upgrade --force benchflow`). The `bench traj` commands
+also print a one-line upgrade hint when a newer release is available.
+
+Prefer the terminal instead? The guided upload inspects before anything leaves
+your machine — it renders a redacted trajectory report (step counts, masked
+secrets, preview) and asks for confirmation:
 
 ```bash
-# Install or upgrade BenchFlow
 uv tool install --python 3.12 --upgrade benchflow
-
-# Interactive upload (prompts for path, GitHub ID, then email)
 bench traj upload
-
-# Or provide every input up front
-bench traj upload /absolute/path/to/trial \
-  --github-id YOUR_GITHUB_ID \
-  --email YOU@example.com
 ```
 
-The path may be a trial directory, a directory of JSONL files, or one JSONL
-file. Path and contributor details are required inputs; any that are omitted are
-prompted for interactively. Detected secret values are replaced locally with
-`<XXX-benchflow-key-values-XXX>` before upload. Contributor details are stored
-in `manifest.json`. After the path is entered, the CLI shows a redacted preview
-and a trajectory report with partitioned human, thinking, and tool-call counts,
-creation time, file size, and the number of masked key values. Interactive users
-confirm the report before a byte-progress display starts the upload. The full
-redacted report is retained in the uploaded `manifest.json`.
-See the concise [upload skill](./.agents/skills/benchflow-traj-upload/SKILL.md)
-or the [trajectory upload guide](./docs/traj-upload.md).
+Detected secret values are replaced locally with
+`<XXX-benchflow-key-values-XXX>` before upload, and the full redacted report is
+retained in the uploaded `manifest.json`. See the
+[upload skill](./.agents/skills/benchflow-traj-upload/SKILL.md) or the
+[trajectory upload guide](./docs/traj-upload.md).
 
-## Qucik start: 2. Run with a ChatGPT or Claude subscription
+Optional — set the skill up once, then keep talking to the agent:
+
+```bash
+npx skills add benchflow-ai/benchflow --skill benchflow-traj-upload
+# or, if BenchFlow is already installed:
+bench traj setup
+```
+
+`npx skills add` asks which agents to install for. `bench traj setup` copies
+the skill into this project and prints the same agent prompt. See the
+[upload skill](./.agents/skills/benchflow-traj-upload/SKILL.md).
+
+## Quick start: 2. Run with a ChatGPT or Claude subscription
 
 No OpenAI or Anthropic API key is required. Start Docker, install BenchFlow,
 then run **one** of these options. BenchFlow detects the saved host login and

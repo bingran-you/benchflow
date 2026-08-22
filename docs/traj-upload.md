@@ -1,13 +1,63 @@
 # Contribute trajectory captures
 
-Anyone with BenchFlow installed can contribute a completed trajectory through
-either an interactive prompt:
+**Don't follow these steps yourself — send them to your coding agent.** Copy
+the block below and paste it as a message to Claude Code, Codex, OpenCode, or
+Cursor. You do not run a BenchFlow command.
+
+> Submit my relevant local Claude Code, Codex, OpenCode, or Cursor session from the re:Agent e2e agentic science / ai4bio hackathon (last 72 hours, on this laptop) to the BenchFlow eval prize.
+>
+> 1. First make sure the latest benchflow CLI is installed: uv tool install --python 3.12 --upgrade --force benchflow
+>
+> 2. Then read https://raw.githubusercontent.com/benchflow-ai/benchflow/main/.agents/skills/benchflow-traj-upload/SKILL.md and follow it: find a session, open the viewer, and upload only after I (the human) review it.
+
+The agent reads the skill, finds a local session, opens the viewer, and
+uploads after you say it looks good.
+
+The prompt has the agent install the latest BenchFlow first (`uv tool
+install --python 3.12 --upgrade --force benchflow`) because `bench traj setup`
+and the session-JSONL viewer require 0.7.1+. When a newer release is available
+on PyPI, `bench traj setup` and `bench traj upload` print a one-line upgrade
+hint.
+
+## Optional: set the skill up once
+
+If you want later chats to know the workflow without pasting the long prompt:
+
+```bash
+npx skills add benchflow-ai/benchflow --skill benchflow-traj-upload
+```
+
+or, with BenchFlow already installed:
+
+```bash
+bench traj setup
+```
+
+`npx skills add` is interactive: it asks which agents to install for
+(Claude Code, Codex, Cursor, and other [Agent Skills](https://agentskills.io)
+hosts). `bench traj setup` copies the skill into
+`.agents/skills/benchflow-traj-upload/`, prints the same agent prompt, and can
+list sessions or open the viewer. After setup, a short ask is enough:
+**submit my relevant session to the eval prize**.
+
+`bench traj setup --prompt` prints only the copy-paste agent prompt.
+`bench traj setup --list` lists recent local sessions.
+
+## Optional: interactive upload without an agent
+
+Prefer the terminal? The guided flow inspects and confirms before anything
+leaves the machine:
 
 ```bash
 bench traj upload
 ```
 
-or one fully specified command:
+It prompts for the path first, then validates, redacts, and inspects the local
+trajectory; renders the report and preview; fills GitHub ID and email from
+`gh` / `git` (or `BENCHFLOW_GITHUB_ID` / `BENCHFLOW_EMAIL`), prompting only for
+what inference cannot find; and asks for confirmation before uploading.
+
+The fully specified command is non-interactive for scripts and agents:
 
 ```bash
 bench traj upload path/to/trial \
@@ -15,18 +65,31 @@ bench traj upload path/to/trial \
   --email YOU@example.com
 ```
 
-When values are omitted, BenchFlow prompts for the path first. It then validates,
-redacts, and inspects the local trajectory; renders the report and preview;
-prompts for a missing GitHub ID and email; and asks for confirmation before
-uploading. `path/to/trial` may be a trial directory containing `trajectory/`, a
-directory of JSONL files, or one JSONL file. BenchFlow rejects duplicate
-object keys and non-finite numbers, but detected secret-like values do not make
+`path/to/trial` may be a trial directory containing `trajectory/`, a directory
+of JSONL files, or one JSONL file. BenchFlow rejects duplicate object keys and
+non-finite numbers, but detected secret-like values do not make
 otherwise-valid JSONL ineligible: the local staging pass replaces them with
 `<XXX-benchflow-key-values-XXX>`. It applies the same structural redaction to
-manifest metadata, computes a content digest, and uploads a manifest last. Use
-`--dry-run` to inspect the
-staged file list, digest, sizes, ignored siblings, and redaction count without
-making a network request.
+manifest metadata, computes a content digest, and uploads a manifest last. The
+first request can take up to a minute; retries are safe. Use `--dry-run` to
+inspect the staged file list, digest, sizes, ignored siblings, and redaction
+count without making a network request; its output ends with a plain
+`Masked for you: ...` line itemizing the masked secrets by kind,
+which the contributor skill lifts into the viewer's confirm bar via
+`bench eval view --confirm --redaction-summary`.
+
+Uploads are tagged with the repository the session was about: unless you pass
+`--source-id`, the CLI reads the session's recorded working directory,
+resolves its git `origin` remote, and stores `repo/<owner>/<name>` as the
+manifest source id, printing
+`Repo: owner/name (from session cwd /path/to/project; use --no-repo to omit)`
+(the local path appears in terminal output only, never in the upload). The
+session's own recorded cwd is the only source for the tag — the directory you
+run the upload from is never consulted, so a session recorded outside a repo
+is never attributed to the checkout you happen to upload it from. Pass
+`--no-repo` to keep the tag out (for example for private repositories); when
+the session has no recorded cwd, the directory no longer exists, or no GitHub
+remote resolves, the upload silently keeps the path-derived source id.
 
 ## Local trajectory report
 
@@ -43,7 +106,18 @@ The report is generated only from the staged, redacted copy. It shows:
   no extractable redacted text are skipped instead of producing placeholder
   steps such as `Assistant response`;
 - the number of API-key or secret-like values replaced with
-  `<XXX-benchflow-key-values-XXX>`; and
+  `<XXX-benchflow-key-values-XXX>`, followed by a `Masked for you` line that
+  itemizes what kind of secret each replacement was — API keys, bearer tokens,
+  private key blocks, passwords, URL credentials, and credential-bearing field
+  values, e.g. `2 API keys, 1 bearer token — originals never leave this
+  machine` — with a reminder that redaction ran locally and the server
+  independently rescans staged artifacts. The categories name what the
+  redaction rules actually detect (there is no PII/email detection); when
+  nothing matched, the line reads `No secrets or personal identifiers detected
+  — nothing needed masking.` The per-category counts are display-only: the
+  uploaded `trajectory_report` manifest field is validated by the server with
+  a closed schema and an exact recompute check, so it keeps only the total
+  masked-value count; and
 - the first five meaningful steps as a preview containing up to the first 100
   words of each step's redacted text.
 
@@ -61,22 +135,38 @@ count, and every displayed preview row. The server validates those values
 against the declared artifacts and rejects inconsistent report metadata.
 
 Interactive mode shows this report before contributor prompts and requires an
-explicit confirmation. A command containing the path, `--github-id`, and
-`--email` remains non-interactive: it shows the same report and starts uploading
-without another prompt. Upload progress is displayed by processed file bytes.
+explicit confirmation. A command whose path and identity resolve without
+prompting — flags or `gh` / `git` inference — remains non-interactive: it shows
+the same report and starts uploading without another prompt. Upload progress is
+displayed by processed file bytes.
 
 GitHub ID and email are required inputs for both public and direct uploads, but
-may be provided through options or prompts. They are self-asserted contributor
-provenance, not proof of account ownership, and are stored in `manifest.json` as
-`{"contributor":{"github_id":"...","email":"..."}}`. An interactively
-entered email is visible in the terminal prompt but is not repeated in the
-success output. Dataset operators may retain or publish the manifest; use an
-address you are comfortable associating with the contribution.
+may be provided through options, inference, or prompts. They are self-asserted
+contributor provenance, not proof of account ownership, and are stored in
+`manifest.json` as `{"contributor":{"github_id":"...","email":"..."}}`. An
+interactively entered email is visible in the terminal prompt but is not
+repeated in the success output. Dataset operators may retain or publish the
+manifest; use an address you are comfortable associating with the contribution.
 
 The public broker URL is built into the CLI. `BENCHFLOW_TRAJ_BROKER_URL` can
 override it for development or disaster recovery, and
 `BENCHFLOW_TRAJ_UPLOADED_BY` can add a non-secret contributor label. Do not put
 credentials or personal data in either label.
+
+## Viewer
+
+`bench eval view PATH` serves a localhost page for a trial directory, a job
+directory, or a raw Claude Code / Codex / ACP session JSONL file. The
+contributor skill opens this before upload. Viewing a JSONL file does not
+write `trajectory.html` next to the session. With `--confirm` (0.7.2+) the
+page adds an approve/reject bar and the process prints `DECISION: approved`
+or `DECISION: rejected` and exits (0 approve / 3 reject), so the agent can
+wait on the click instead of a chat reply. The viewer shows the original
+session and never redacts; `--redaction-summary "2 API keys, 1 bearer token"`
+adds a display-only note to the confirm bar ("Before upload, BenchFlow
+masks: … Originals never leave this machine.") so the reviewer sees what the
+upload step will mask — the skill fills it from the `Masked for you` line of
+a `bench traj upload --dry-run`.
 
 ## What reaches the dataset
 
@@ -96,8 +186,8 @@ policy provide recovery and bound retention for attempted overwrites; the
 deployment does not configure an immutable-storage policy.
 
 The digest excludes contributor labels, timestamps, and transport details, so
-the same redacted bytes are idempotent across machines. Repeating an ingested
-upload prints `Already uploaded` and performs no blob writes.
+the same redacted bytes are idempotent across machines. Repeating a submitted
+upload prints `Already submitted` and performs no blob writes.
 
 The local replacement pass is designed to make otherwise-valid JSONL containing
 detected keys safe to upload. Review sensitive trajectories before contributing

@@ -31,6 +31,7 @@ from services.trajectory_upload.broker_app import (
     create_app,
 )
 from services.trajectory_upload.contract import (
+    CaptureStatusInfo,
     UploadGrant,
     UploadObject,
     UploadRequest,
@@ -44,6 +45,7 @@ from services.trajectory_upload.validation import (
 from services.trajectory_upload.validator import (
     AzureCaptureValidator,
     _capture_from_event,
+    drain,
 )
 
 
@@ -85,6 +87,9 @@ class FakeBroker:
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
+
+    def get_capture_status(self, digest: str, *, client_ip: str) -> CaptureStatusInfo:
+        raise AssertionError("handshake tests must not reach the status route")
 
 
 def test_broker_cold_start_constructs_one_shared_backend() -> None:
@@ -636,6 +641,18 @@ class FakeTable:
         self.entities.append(entity)
         self.version += 1
 
+    def create_entity(self, entity: dict) -> None:
+        from azure.core.exceptions import ResourceExistsError
+
+        for existing in self.entities:
+            if (
+                existing["PartitionKey"] == entity["PartitionKey"]
+                and existing["RowKey"] == entity["RowKey"]
+            ):
+                raise ResourceExistsError("entity already exists")
+        self.entities.append(entity)
+        self.version += 1
+
     def update_entity(self, *, entity: dict, etag: str, **_kwargs) -> None:
         assert etag == str(self.version)
         self.entities.append(entity)
@@ -695,7 +712,7 @@ def test_broker_regrant_does_not_downgrade_ledger_state(
         ),
         ip_hash_key=b"test",
     )
-    monkeypatch.setattr(backend, "_consume_rate_limit", lambda _client_ip: None)
+    monkeypatch.setattr(backend, "_consume_rate_limit", lambda *_args: None)
     monkeypatch.setattr(
         "azure.storage.blob.generate_blob_sas", lambda **_kwargs: "sp=c&sig=test"
     )
@@ -730,7 +747,7 @@ def test_broker_persists_declared_artifact_sizes(
         ),
         ip_hash_key=b"test",
     )
-    monkeypatch.setattr(backend, "_consume_rate_limit", lambda _client_ip: None)
+    monkeypatch.setattr(backend, "_consume_rate_limit", lambda *_args: None)
     monkeypatch.setattr(
         "azure.storage.blob.generate_blob_sas", lambda **_kwargs: "sp=c&sig=test"
     )
@@ -776,7 +793,7 @@ def test_broker_rejects_manifest_change_during_validation(
         blob_service=SimpleNamespace(),
         ip_hash_key=b"test",
     )
-    monkeypatch.setattr(backend, "_consume_rate_limit", lambda _client_ip: None)
+    monkeypatch.setattr(backend, "_consume_rate_limit", lambda *_args: None)
 
     with pytest.raises(UploadDeclarationConflict):
         backend.create_upload(request, client_ip="127.0.0.1")
@@ -820,7 +837,7 @@ def test_broker_supersedes_conflicting_incomplete_attempt(
         ),
         ip_hash_key=b"test",
     )
-    monkeypatch.setattr(backend, "_consume_rate_limit", lambda _client_ip: None)
+    monkeypatch.setattr(backend, "_consume_rate_limit", lambda *_args: None)
     monkeypatch.setattr(
         "azure.storage.blob.generate_blob_sas", lambda **_kwargs: "sp=c&sig=test"
     )
@@ -865,7 +882,7 @@ def test_broker_reopens_rejected_digest_in_isolated_attempt(
         ),
         ip_hash_key=b"test",
     )
-    monkeypatch.setattr(backend, "_consume_rate_limit", lambda _client_ip: None)
+    monkeypatch.setattr(backend, "_consume_rate_limit", lambda *_args: None)
     monkeypatch.setattr(
         "azure.storage.blob.generate_blob_sas", lambda **_kwargs: "sp=c&sig=test"
     )
@@ -907,6 +924,114 @@ def test_terminal_digest_handshakes_consume_rate_limit(
         backend.create_upload(request, client_ip="127.0.0.1")
     with pytest.raises(RateLimited):
         backend.create_upload(request, client_ip="127.0.0.1")
+
+
+def _rate_backend(
+    table: FakeTable, *, rate_limit: int = 20, ip_rate_limit: int = 500
+) -> AzureUploadBroker:
+    return AzureUploadBroker(
+        account_name="account",
+        container="bronze",
+        table=table,
+        blob_service=SimpleNamespace(),
+        ip_hash_key=b"test",
+        rate_limit=rate_limit,
+        ip_rate_limit=ip_rate_limit,
+    )
+
+
+def test_shared_nat_contributors_have_independent_budgets() -> None:
+    """A venue NAT full of contributors must not share one hourly budget."""
+    backend = _rate_backend(FakeTable(), rate_limit=1, ip_rate_limit=400)
+    for index in range(300):
+        backend._consume_rate_limit("203.0.113.7", f"contributor-{index}")
+
+    with pytest.raises(RateLimited):
+        backend._consume_rate_limit("203.0.113.7", "contributor-0")
+
+
+def test_contributor_budget_refills_continuously() -> None:
+    """Retry-After reflects the next token, not the top of the clock hour."""
+    table = FakeTable()
+    backend = _rate_backend(table, rate_limit=2)
+    backend._consume_rate_limit("198.51.100.9", "octocat")
+    backend._consume_rate_limit("198.51.100.9", "octocat")
+
+    with pytest.raises(RateLimited) as excinfo:
+        backend._consume_rate_limit("198.51.100.9", "octocat")
+    assert 1 <= excinfo.value.retry_after <= 1800
+
+    bucket = next(
+        entity
+        for entity in reversed(table.entities)
+        if entity["PartitionKey"] == "ratebucket"
+        and entity["RowKey"].startswith("contributor-")
+    )
+    bucket["updated_at"] = (datetime.now(UTC) - timedelta(minutes=31)).isoformat()
+    backend._consume_rate_limit("198.51.100.9", "octocat")
+
+
+def test_token_bucket_survives_contended_conditional_updates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guards PR #1027's burst fix: ETag races must not fail a crowd closed."""
+
+    class ContendedTable(FakeTable):
+        def __init__(self) -> None:
+            super().__init__()
+            self.conflicts = 0
+
+        def update_entity(self, *, entity: dict, etag: str, **kwargs) -> None:
+            from azure.core.exceptions import ResourceModifiedError
+
+            if self.conflicts:
+                self.conflicts -= 1
+                raise ResourceModifiedError("etag changed")
+            super().update_entity(entity=entity, etag=etag, **kwargs)
+
+    table = ContendedTable()
+    backend = _rate_backend(table, rate_limit=20, ip_rate_limit=500)
+    waits: list[float] = []
+    monkeypatch.setattr(
+        "services.trajectory_upload.azure_backend.time",
+        SimpleNamespace(sleep=waits.append),
+    )
+    backend._consume_rate_limit("203.0.113.9", "contended")
+
+    table.conflicts = 8
+    backend._consume_rate_limit("203.0.113.9", "contended")
+    assert waits  # the survivor backed off between optimistic retries
+
+
+def test_ip_backstop_caps_identity_rotation() -> None:
+    """One host rotating github ids is still bounded by the per-IP bucket."""
+    backend = _rate_backend(FakeTable(), rate_limit=20, ip_rate_limit=3)
+    for index in range(3):
+        backend._consume_rate_limit("192.0.2.4", f"rotating-{index}")
+
+    with pytest.raises(RateLimited):
+        backend._consume_rate_limit("192.0.2.4", "rotating-3")
+
+    backend._consume_rate_limit("192.0.2.5", "rotating-3")
+
+
+def test_validator_drain_stops_on_empty_queue_and_budget() -> None:
+    class CountingValidator:
+        def __init__(self, available: int) -> None:
+            self.available = available
+            self.calls = 0
+
+        def run_once(self) -> bool:
+            self.calls += 1
+            return self.calls <= self.available
+
+    counting = CountingValidator(available=3)
+    assert drain(counting, budget_seconds=30.0) == 3
+    assert counting.calls == 4
+
+    exhausted = CountingValidator(available=10)
+    assert drain(exhausted, budget_seconds=0.0) == 0
+    assert exhausted.calls == 0
 
 
 def _quarantine_capture(tmp_path: Path) -> tuple[str, dict[str, bytes]]:
@@ -1233,7 +1358,9 @@ def test_pending_oversized_artifact_event_is_rejected_and_cleaned(
     queue = FakeQueue(event)
     table = _pending_table(digest)
     container = FakeContainer(blobs)
-    monkeypatch.setattr("services.trajectory_upload.validator.MAX_ARTIFACT_BYTES", 1)
+    monkeypatch.setattr(
+        "services.trajectory_upload.validator.max_artifact_bytes", lambda _name: 1
+    )
 
     assert AzureCaptureValidator(
         container=container, queue=queue, table=table
@@ -1294,7 +1421,8 @@ def test_pending_artifact_event_enforces_legacy_aggregate_limit(
     container = FakeContainer(blobs)
     queue = FakeQueue(event)
     monkeypatch.setattr(
-        "services.trajectory_upload.validator.MAX_ARTIFACT_BYTES", len(content) + 1
+        "services.trajectory_upload.validator.max_artifact_bytes",
+        lambda _name: len(content) + 1,
     )
     monkeypatch.setattr(
         "services.trajectory_upload.validator.MAX_CAPTURE_BYTES", capture_limit
@@ -1640,3 +1768,167 @@ def test_expired_validation_lease_is_reclaimed(tmp_path: Path) -> None:
     assert table.entities[-1]["status"] == "ingested"
     assert container.uploaded[-1] == f"sources/community/{digest}/manifest.json"
     assert queue.deleted == [("m1", "p1")]
+
+
+class FakeStatusBroker:
+    """Status-route double; the handshake route is never exercised here."""
+
+    def __init__(self, result: CaptureStatusInfo | Exception) -> None:
+        self.result = result
+        self.client_ip: str | None = None
+        self.digest: str | None = None
+
+    def create_upload(self, request: UploadRequest, *, client_ip: str) -> UploadGrant:
+        raise AssertionError("status tests must not reach the handshake route")
+
+    def get_capture_status(self, digest: str, *, client_ip: str) -> CaptureStatusInfo:
+        self.digest = digest
+        self.client_ip = client_ip
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+def test_capture_status_route_reports_states_and_rate_limit() -> None:
+    """GET /v1/uploads/{digest} maps ledger states, 429s, and forwarded IPs."""
+    digest = "ab" * 32
+    backend = FakeStatusBroker(
+        CaptureStatusInfo(
+            digest=digest,
+            status="ingested",
+            prefix=f"sources/community/{digest}/",
+            updated_at="2026-08-16T00:00:00+00:00",
+        )
+    )
+    response = TestClient(create_app(backend)).get(
+        f"/v1/uploads/{digest}",
+        headers={"x-forwarded-for": "spoofed, 203.0.113.9"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["digest"] == f"sha256:{digest}"
+    assert payload["status"] == "ingested"
+    assert payload["prefix"] == f"sources/community/{digest}/"
+    assert backend.digest == digest
+    assert backend.client_ip == "203.0.113.9"
+
+    rejected = TestClient(
+        create_app(
+            FakeStatusBroker(
+                CaptureStatusInfo(
+                    digest=digest, status="rejected", detail="size mismatch"
+                )
+            )
+        )
+    ).get(f"/v1/uploads/{digest}")
+    assert rejected.status_code == 200
+    assert rejected.json()["status"] == "rejected"
+    assert rejected.json()["detail"] == "size mismatch"
+    assert "prefix" not in rejected.json()
+
+    unknown = TestClient(
+        create_app(FakeStatusBroker(CaptureStatusInfo(digest=digest, status="unknown")))
+    ).get(f"/v1/uploads/{digest}")
+    assert unknown.status_code == 200
+    assert unknown.json() == {"digest": f"sha256:{digest}", "status": "unknown"}
+
+    limited = TestClient(create_app(FakeStatusBroker(RateLimited(42)))).get(
+        f"/v1/uploads/{digest}"
+    )
+    assert limited.status_code == 429
+    assert limited.headers["Retry-After"] == "42"
+
+
+def test_capture_status_route_rejects_malformed_digests() -> None:
+    """Only a 64-lowercase-hex digest reaches the backend; 404 stays reserved
+    for deployments that predate the endpoint."""
+    backend = FakeStatusBroker(AssertionError("malformed digest reached the backend"))
+    client = TestClient(create_app(backend))
+
+    non_hex = client.get(f"/v1/uploads/{'zz' * 32}")
+    assert non_hex.status_code == 400
+
+    uppercase = client.get(f"/v1/uploads/{'AB' * 32}")
+    assert uppercase.status_code == 400
+
+    too_short = client.get(f"/v1/uploads/{'ab' * 31}")
+    assert too_short.status_code == 400
+
+
+def test_azure_backend_status_reads_ledger_without_upload_quota() -> None:
+    """Status polls consume a separate, larger budget than upload grants."""
+    digest = "ab" * 32
+    table = FakeTable(
+        [
+            {
+                "PartitionKey": "capture",
+                "RowKey": digest,
+                "status": "ingested",
+                "updated_at": "2026-08-16T00:00:00+00:00",
+            }
+        ]
+    )
+    backend = AzureUploadBroker(
+        account_name="account",
+        container="bronze",
+        table=table,
+        blob_service=SimpleNamespace(),
+        ip_hash_key=b"test",
+        rate_limit=0,  # any upload-quota consumption would 429 immediately
+        status_rate_limit=3,
+    )
+
+    info = backend.get_capture_status(digest, client_ip="127.0.0.1")
+    assert info.status == "ingested"
+    assert info.prefix == f"sources/community/{digest}/"
+    assert info.updated_at == "2026-08-16T00:00:00+00:00"
+
+    assert backend.get_capture_status("cd" * 32, client_ip="127.0.0.1").status == (
+        "unknown"
+    )
+    backend.get_capture_status(digest, client_ip="127.0.0.1")
+    with pytest.raises(RateLimited):
+        backend.get_capture_status(digest, client_ip="127.0.0.1")
+
+    status_rows = {
+        entity["RowKey"]
+        for entity in table.entities
+        if entity["PartitionKey"] == "ratebucket"
+    }
+    assert any(row.startswith("status-") for row in status_rows)
+    assert not any(row.startswith(("contributor-", "ip-")) for row in status_rows)
+
+
+def test_azure_backend_status_bounds_detail_and_hides_corrupt_states() -> None:
+    """Rejection detail is truncated and non-public ledger states stay opaque."""
+    digest = "ab" * 32
+    rejected = AzureUploadBroker(
+        account_name="account",
+        container="bronze",
+        table=FakeTable(
+            [
+                {
+                    "PartitionKey": "capture",
+                    "RowKey": digest,
+                    "status": "rejected",
+                    "detail": "x" * 600,
+                }
+            ]
+        ),
+        blob_service=SimpleNamespace(),
+        ip_hash_key=b"test",
+    )
+    info = rejected.get_capture_status(digest, client_ip="127.0.0.1")
+    assert info.status == "rejected"
+    assert info.detail == "x" * 512
+
+    corrupt = AzureUploadBroker(
+        account_name="account",
+        container="bronze",
+        table=FakeTable(
+            [{"PartitionKey": "capture", "RowKey": digest, "status": "exploded"}]
+        ),
+        blob_service=SimpleNamespace(),
+        ip_hash_key=b"test",
+    )
+    assert corrupt.get_capture_status(digest, client_ip="127.0.0.1").status == "unknown"

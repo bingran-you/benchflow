@@ -9,15 +9,16 @@ import logging
 import os
 import re
 import tempfile
+import time
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+from benchflow.publish.traj_capture import max_artifact_bytes
 from services.trajectory_upload.contract import (
     ARTIFACT_NAME,
-    MAX_ARTIFACT_BYTES,
     MAX_CAPTURE_BYTES,
     MAX_MANIFEST_BYTES,
 )
@@ -176,8 +177,8 @@ class AzureCaptureValidator:
             ).get_blob_properties()
         except ResourceNotFoundError:
             return None
-        if properties.size > MAX_ARTIFACT_BYTES:
-            return f"artifact exceeds {MAX_ARTIFACT_BYTES} bytes: {relname}"
+        if properties.size > max_artifact_bytes(relname):
+            return f"artifact exceeds {max_artifact_bytes(relname)} bytes: {relname}"
 
         declared = self._declared_artifacts(digest, attempt_id)
         if declared is not None and declared.get(relname) != properties.size:
@@ -194,8 +195,11 @@ class AzureCaptureValidator:
                 )
             except ResourceNotFoundError:
                 continue
-            if size > MAX_ARTIFACT_BYTES:
-                return f"artifact exceeds {MAX_ARTIFACT_BYTES} bytes: {item_relname}"
+            if size > max_artifact_bytes(item_relname):
+                return (
+                    f"artifact exceeds {max_artifact_bytes(item_relname)} "
+                    f"bytes: {item_relname}"
+                )
             capture_bytes += size
             if capture_bytes > MAX_CAPTURE_BYTES:
                 return f"capture exceeds {MAX_CAPTURE_BYTES} bytes"
@@ -283,6 +287,11 @@ class AzureCaptureValidator:
             "benchflow_version": capture.manifest.tool.version,
         }
         for artifact in capture.manifest.artifacts:
+            content_type = (
+                "application/zip"
+                if artifact.name.endswith(".zip")
+                else "application/jsonl"
+            )
             with (
                 suppress(ResourceExistsError),
                 capture.artifact_paths[artifact.name].open("rb") as stream,
@@ -292,7 +301,7 @@ class AzureCaptureValidator:
                     data=stream,
                     overwrite=False,
                     metadata=metadata,
-                    content_settings=ContentSettings(content_type="application/jsonl"),
+                    content_settings=ContentSettings(content_type=content_type),
                 )
         with suppress(ResourceExistsError):
             self.container.upload_blob(
@@ -435,9 +444,26 @@ def _parse_datetime(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
+def drain(validator: Any, *, budget_seconds: float) -> int:
+    """Process queue messages until the queue is empty or the budget expires.
+
+    One Job execution used to handle a single message, which capped promotion
+    throughput at the container start rate. Draining keeps the replica busy
+    for as long as its budget allows; the budget must stay below the Job's
+    replica timeout so Azure never kills a replica mid-validation.
+    """
+    deadline = time.monotonic() + budget_seconds
+    processed = 0
+    while time.monotonic() < deadline and validator.run_once():
+        processed += 1
+    return processed
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    AzureCaptureValidator.from_env().run_once()
+    budget = float(os.environ.get("AZURE_VALIDATOR_DRAIN_SECONDS", "1500"))
+    processed = drain(AzureCaptureValidator.from_env(), budget_seconds=budget)
+    logger.info("validator drained %d queue messages", processed)
 
 
 if __name__ == "__main__":

@@ -386,12 +386,24 @@ required with it (a run without one exits with an actionable error).
 | `--allow-open-network` | `false` | Run reviewers without the no-internet declaration (required on backends that cannot enforce isolation, e.g. agentcore; recorded in the report) |
 | `--out-dir`, `-o` | `jobs/review-<ts>` | Review output directory |
 
-A rubric is a JSON object with one `criteria` list; each criterion is three
-strings —
-`name` (identifier; becomes a structured-output field), `description`
-(author-facing documentation, never shown to the reviewer), and `guidance`
-(the grading contract the reviewer follows). The reviewer answers each
-criterion with `pass` / `fail` / `not_applicable` plus an explanation.
+A rubric is a versionless JSON object with one `criteria` list. BenchFlow
+supports two backward-compatible shapes:
+
+- Legacy v0.1 criteria contain exactly `name`, `description`, and `guidance`;
+  the reviewer returns `pass`, `fail`, or `not_applicable` plus an explanation.
+- Weighted v0.2 criteria all add strict integer `blocker` (`0` or `1`) and
+  `weight` (`1` through `10`) fields. Blockers return `pass` or `fail`; scored
+  criteria return `0`, `1`, or `2`. Blocker weights do not enter the quality
+  calculation.
+
+For v0.2, `raw_quality` is the weighted scored points divided by twice the
+sum of non-blocker weights. The deterministic reward and all blocker verdicts
+gate that quality: if either gate fails, `gated_quality` is zero and the result
+is `not_publishable`. Otherwise, quality `>= 0.80` is `publishable`, quality
+`>= 0.65` is `presentable_with_revisions`, and lower quality is
+`not_publishable`. The wrapper reward still means only that the review is
+structurally valid; it is not a quality or publication score. See
+[Rubric review](../rubric-review.md) for the full contract and report shape.
 
 ### bench eval list
 
@@ -413,11 +425,33 @@ bench eval metrics jobs/ --json
 
 ### bench eval view
 
-Serve a trial trajectory viewer in the browser for a rollout or job directory.
+Serve a trial trajectory viewer in the browser for a rollout directory, a job
+directory, or a Claude Code / Codex / ACP session JSONL file. Contributors
+reach this through the [trajectory upload skill](../../.agents/skills/benchflow-traj-upload/SKILL.md),
+not by running the command themselves.
+
+`--confirm` adds a sticky approve/reject bar to the page. When the reviewer
+clicks **Approve & submit** or **Not this one**, the server prints one
+machine-readable line to stdout — `DECISION: approved` or
+`DECISION: rejected` — and exits. Exit codes: `0` approved (also the normal
+Ctrl+C stop), `3` rejected — deliberately not `1`/`2`, which stay reserved
+for errors and usage mistakes. Without `--confirm` the server has no
+`/decision` endpoint and runs until Ctrl+C, as before.
+
+`--redaction-summary "2 API keys, 1 bearer token"` adds a display-only note to
+the `--confirm` bar — "Before upload, BenchFlow masks: … Originals never leave
+this machine." — so the reviewer sees what upload-time redaction will mask
+(the viewer itself shows the original session and never redacts). The upload
+skill fills it from the `Masked for you` line printed by
+`bench traj upload PATH --dry-run`. Without `--confirm` the flag has no
+effect; without the flag the bar is unchanged.
 
 ```bash
 bench eval view jobs/run/task__abc123
 bench eval view jobs/ --port 9000
+bench eval view ~/.claude/projects/<project>/<session>.jsonl
+bench eval view ~/.claude/projects/<project>/<session>.jsonl --confirm
+bench eval view session.jsonl --confirm --redaction-summary "2 API keys, 1 bearer token"
 ```
 
 ## bench train
@@ -854,35 +888,61 @@ and hosted-provider browsing to [`bench hub list`](#bench-hub). The old
 `bench environment create|list|cleanup` and `show|inspect` (plus `list
 --provider`/`--hub`) still work, each printing a one-line stderr notice.
 
+## bench traj setup
+
+Install the trajectory skill into the current project, or print the line
+contributors paste into an agent. Interactive by default. `--yes` copies the
+skill without prompts. `--prompt` prints only the copy-paste line. `--list`
+prints recent Claude Code / Codex / trial sessions. On start, the command
+checks PyPI for a newer release (2 s timeout, silent on any failure) and
+prints a one-line upgrade hint when the installed version is outdated; set
+`BENCHFLOW_SKIP_UPDATE_CHECK=1` to disable the check.
+
+```bash
+bench traj setup
+bench traj setup --yes
+bench traj setup --prompt
+bench traj setup --list
+```
+
+See [Trajectory upload](../traj-upload.md).
+
 ## bench traj upload
 
 Validate, redact, and contribute trajectory JSONL through BenchFlow's public
-broker. `PATH` can be one JSONL file, a directory of JSONL files, or a trial
-directory containing `trajectory/`. The command stages only JSONL artifacts,
-writes a content-addressed manifest last, and treats an already-ingested digest
-as a successful no-op. Run it without `PATH`, `--github-id`, or `--email` to be
-prompted for those three inputs in that order. Detected secret values are
-replaced locally with `<XXX-benchflow-key-values-XXX>` before upload. After the
-path is known, the CLI renders a redacted preview and format-aware trajectory
-report. Interactive uploads require confirmation and then show byte progress;
-the fully specified form remains non-interactive.
+broker. This is what the [upload skill](../../.agents/skills/benchflow-traj-upload/SKILL.md)
+runs after the user reviews the viewer; the guided form below is the direct
+terminal alternative. `PATH` can be one JSONL file, a directory of JSONL files,
+or a trial directory containing `trajectory/`. The command stages only JSONL
+artifacts, writes a content-addressed manifest last, and treats a digest that
+is already in inbox or community storage as `Already submitted`. Detected
+secret values are replaced locally with `<XXX-benchflow-key-values-XXX>`
+before upload. After the path is known, the CLI renders a redacted preview and
+format-aware trajectory report. GitHub username and email are inferred from
+`gh` / `git` when omitted; run the bare command to be prompted for the path
+and for identity that inference cannot find. Sessions that prompted require
+confirmation and then show byte progress; invocations that resolved without
+prompting stay non-interactive. Like `bench traj setup`, the command starts
+with a silent-on-failure PyPI check and prints a one-line upgrade hint when a
+newer BenchFlow release is available (`BENCHFLOW_SKIP_UPDATE_CHECK=1`
+disables it).
 
 ```bash
 bench traj upload
+bench traj upload path/to/your-session.jsonl
 bench traj upload path/to/trial --github-id octocat --email octocat@example.com
-bench traj upload path/to/trajectory.jsonl --github-id octocat \
-  --email octocat@example.com --source-id my-project/run-42
-bench traj upload path/to/trial --github-id octocat \
-  --email octocat@example.com --dry-run
+bench traj upload path/to/trajectory.jsonl --source-id my-project/run-42
+bench traj upload path/to/trial --dry-run
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--github-id` | prompted when omitted | Self-asserted GitHub username stored in `manifest.json` |
-| `--email` | prompted when omitted | Contributor email stored in `manifest.json`; not repeated in success output |
+| `--github-id` | inferred, then prompted | Self-asserted GitHub username stored in `manifest.json`; inferred from `gh` / `git` / `BENCHFLOW_GITHUB_ID` |
+| `--email` | inferred, then prompted | Contributor email stored in `manifest.json`; inferred from `git` / `BENCHFLOW_EMAIL`; not repeated in success output |
 | `--source-id` | derived from `PATH` | Stable contributor/run label stored in the manifest |
+| `--repo` / `--no-repo` | on | Tag the upload with the repository the session was about: `repo/<owner>/<name>` from the session's own recorded cwd git remote (never the invocation directory) becomes the source id and the CLI prints `Repo: owner/name (from session cwd <path>; use --no-repo to omit)` — the path is terminal-only, never uploaded; explicit `--source-id` wins; sessions without a usable recorded cwd fall back silently to the derived source id |
 | `--preview-steps` | `5` | Number of redacted trajectory steps to preview; accepts 0–20 |
-| `--dry-run` | `false` | Validate, redact, hash, and list staged files without network traffic |
+| `--dry-run` | `false` | Validate, redact, hash, and list staged files without network traffic; ends with a plain `Masked for you: ...` line itemizing masked secrets by kind (API keys, bearer tokens, private key blocks, passwords, URL credentials, credential-bearing field values) for `bench eval view --redaction-summary` |
 | `--direct` | `false` | Use local Azure credentials instead of the public broker; requires the `azure` extra |
 | `--container-url` | — | Azure Blob container URL for `--direct`; alternatively set `BENCHFLOW_AZURE_CONTAINER_URL` |
 

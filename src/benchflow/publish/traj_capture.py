@@ -7,6 +7,7 @@ import json
 import re
 import shutil
 import tempfile
+from collections import Counter
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -15,11 +16,22 @@ from pathlib import Path
 from typing import Any, Never
 
 from benchflow import __version__
-from benchflow.publish.redact import redact_value, redact_value_to_stability
+from benchflow.publish.redact import (
+    redact_value,
+    redact_value_to_stability,
+    redaction_breakdown,
+)
 
 MAX_FILE_BYTES = 128 * 1024**2
 MAX_ARTIFACTS = 8
-MAX_CAPTURE_BYTES = 2 * MAX_FILE_BYTES
+MAX_JSONL_CAPTURE_BYTES = 2 * MAX_FILE_BYTES
+# One optional workspace snapshot may ride along with the JSONL trajectory.
+# Zips above this cap are skipped locally (never created) so contributors'
+# disks and uplinks are not burdened by runaway workspaces.
+MAX_ATTACHMENT_BYTES = 1024**3
+MAX_ATTACHMENT_FILES = 50_000
+MAX_TOTAL_ARTIFACTS = MAX_ARTIFACTS + 1
+MAX_CAPTURE_BYTES = MAX_JSONL_CAPTURE_BYTES + MAX_ATTACHMENT_BYTES
 MAX_MANIFEST_BYTES = 1024**2
 MAX_RUN_METADATA_BYTES = 1024**2
 MAX_UPLOADED_BY_LENGTH = 256
@@ -29,7 +41,48 @@ MAX_JSONL_RECORD_BYTES = 8 * 1024**2
 MAX_JSON_NESTING = 100
 MAX_JSON_NODES = 100_000
 SOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
-ARTIFACT_NAME_PATTERN = re.compile(r"^trajectory/[A-Za-z0-9._-]{1,128}\.jsonl$")
+ARTIFACT_NAME_PATTERN = re.compile(
+    r"^(?:trajectory/[A-Za-z0-9._-]{1,128}\.jsonl"
+    r"|workspace/[A-Za-z0-9._-]{1,128}\.zip)$"
+)
+TRAJECTORY_ARTIFACT_PREFIX = "trajectory/"
+WORKSPACE_ARTIFACT_PREFIX = "workspace/"
+# Directories that never belong in a workspace snapshot: VCS internals,
+# dependency trees, and caches. ``.git`` also keeps credential-bearing
+# remotes and hooks out of the archive.
+WORKSPACE_EXCLUDED_DIRS = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        "node_modules",
+        ".venv",
+        "venv",
+        ".tox",
+        ".uv-cache",
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".cache",
+        ".DS_Store",
+    }
+)
+# Filename shapes that overwhelmingly carry credentials. Workspace archives
+# are uploaded as-is (no content redaction), so obvious secret carriers stay
+# on the contributor's machine.
+WORKSPACE_EXCLUDED_FILES = (
+    # A linked git worktree's ``.git`` is a pointer FILE (not a directory)
+    # carrying a local absolute path; the directory case is excluded above.
+    re.compile(r"^\.git$", re.IGNORECASE),
+    re.compile(r"^\.env(\..+)?$", re.IGNORECASE),
+    re.compile(r".*\.(pem|key|p12|pfx|keystore)$", re.IGNORECASE),
+    re.compile(r"^id_(rsa|dsa|ecdsa|ed25519)(\..+)?$", re.IGNORECASE),
+    re.compile(r"^\.netrc$", re.IGNORECASE),
+    re.compile(r"^\.npmrc$", re.IGNORECASE),
+    re.compile(r"^(credentials|secrets?)(\..+)?$", re.IGNORECASE),
+    re.compile(r"^\.DS_Store$", re.IGNORECASE),
+)
 GITHUB_ID_PATTERN = re.compile(
     rf"^[A-Za-z0-9](?:[A-Za-z0-9-]{{0,{MAX_GITHUB_ID_LENGTH - 2}}}[A-Za-z0-9])?$"
 )
@@ -81,6 +134,10 @@ class StagedTrajectoryArtifacts:
     _metadata_dir: Path | None
     _staging_dir: Path
     _redact: bool
+    # Per-category artifact replacement counts in display order (display-only:
+    # the manifest/server contract stays untouched). Sums to
+    # ``redaction_replacements``.
+    redaction_categories: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -92,6 +149,8 @@ class StagedCapture:
     ignored: tuple[str, ...]
     artifact_redaction_replacements: int
     redaction_replacements: int
+    # Display-only per-category counts for the artifact replacements.
+    artifact_redaction_categories: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -162,13 +221,22 @@ def validate_email(email: str) -> str:
 
 
 def validate_artifact_name(name: str) -> str:
-    """Require the canonical public trajectory object namespace."""
+    """Require the canonical public capture object namespaces."""
     if not ARTIFACT_NAME_PATTERN.fullmatch(name):
-        raise ValueError("artifact name is outside trajectory/*.jsonl")
+        raise ValueError(
+            "artifact name is outside trajectory/*.jsonl and workspace/*.zip"
+        )
     _, replacements = redact_value(name)
     if replacements:
         raise ValueError("artifact filename resembles a secret")
     return name
+
+
+def max_artifact_bytes(name: str) -> int:
+    """Per-artifact byte ceiling for an artifact's namespace."""
+    if name.startswith(WORKSPACE_ARTIFACT_PREFIX):
+        return MAX_ATTACHMENT_BYTES
+    return MAX_FILE_BYTES
 
 
 @contextmanager
@@ -187,9 +255,9 @@ def stage_trajectory_artifacts(
             f"{len(resolved.files)} files"
         )
     capture_bytes = sum(source.stat().st_size for source in resolved.files)
-    if capture_bytes > MAX_CAPTURE_BYTES:
+    if capture_bytes > MAX_JSONL_CAPTURE_BYTES:
         raise ValueError(
-            f"trajectory capture exceeds {MAX_CAPTURE_BYTES} bytes: "
+            f"trajectory capture exceeds {MAX_JSONL_CAPTURE_BYTES} bytes: "
             f"{capture_bytes} bytes"
         )
     for source in resolved.files:
@@ -199,12 +267,15 @@ def stage_trajectory_artifacts(
         staging_dir = Path(temp_name)
         payloads: list[StagedFile] = []
         replacement_count = 0
+        replacement_categories: Counter[str] = Counter()
         for source in resolved.files:
             relname = validate_artifact_name(f"trajectory/{source.name}")
             target = staging_dir / relname
             target.parent.mkdir(parents=True, exist_ok=True)
             if redact:
-                replacements = _redact_jsonl(source, target)
+                replacements = _redact_jsonl(
+                    source, target, categories=replacement_categories
+                )
                 replacement_count += replacements
             else:
                 shutil.copyfile(source, target)
@@ -225,10 +296,10 @@ def stage_trajectory_artifacts(
                     f"{payload.relname} ({payload.size_bytes} bytes)"
                 )
         staged_capture_bytes = sum(payload.size_bytes for payload in payloads)
-        if staged_capture_bytes > MAX_CAPTURE_BYTES:
+        if staged_capture_bytes > MAX_JSONL_CAPTURE_BYTES:
             raise ValueError(
-                f"staged trajectory capture exceeds {MAX_CAPTURE_BYTES} bytes: "
-                f"{staged_capture_bytes} bytes"
+                f"staged trajectory capture exceeds {MAX_JSONL_CAPTURE_BYTES} "
+                f"bytes: {staged_capture_bytes} bytes"
             )
         traj_digest = _trajectory_digest(payloads)
         yield StagedTrajectoryArtifacts(
@@ -240,7 +311,138 @@ def stage_trajectory_artifacts(
             _metadata_dir=resolved.metadata_dir,
             _staging_dir=staging_dir,
             _redact=redact,
+            redaction_categories=redaction_breakdown(replacement_categories),
         )
+
+
+@dataclass(frozen=True)
+class WorkspaceAttachResult:
+    """Outcome of trying to attach a workspace snapshot to staged artifacts."""
+
+    artifacts: StagedTrajectoryArtifacts
+    attached: StagedFile | None
+    file_count: int
+    excluded_count: int
+    skipped_reason: str | None
+
+
+def _workspace_archive_name(folder: Path) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "-", folder.name).strip("-._")
+    return f"workspace/{sanitized[:120] or 'workspace'}.zip"
+
+
+def _workspace_file_excluded(name: str) -> bool:
+    return any(pattern.fullmatch(name) for pattern in WORKSPACE_EXCLUDED_FILES)
+
+
+def _collect_workspace_files(
+    folder: Path, *, max_bytes: int
+) -> tuple[list[Path], int, int] | str:
+    """Walk the workspace, honoring exclusions; return a reason string to skip.
+
+    Aborts the walk as soon as the included size passes ``max_bytes`` so a
+    runaway workspace never costs a full scan, let alone a zip.
+    """
+    import os
+
+    included: list[Path] = []
+    total_bytes = 0
+    excluded = 0
+    for root, dirnames, filenames in os.walk(folder, followlinks=False):
+        kept_dirs = []
+        for dirname in dirnames:
+            if dirname in WORKSPACE_EXCLUDED_DIRS or (Path(root, dirname).is_symlink()):
+                excluded += 1
+            else:
+                kept_dirs.append(dirname)
+        dirnames[:] = kept_dirs
+        for filename in filenames:
+            candidate = Path(root, filename)
+            if candidate.is_symlink() or _workspace_file_excluded(filename):
+                excluded += 1
+                continue
+            try:
+                size = candidate.stat().st_size
+            except OSError:
+                excluded += 1
+                continue
+            total_bytes += size
+            if total_bytes > max_bytes:
+                return f"workspace folder exceeds {max_bytes} bytes before compression"
+            included.append(candidate)
+            if len(included) > MAX_ATTACHMENT_FILES:
+                return f"workspace folder exceeds {MAX_ATTACHMENT_FILES} files"
+    if not included:
+        return "workspace folder has no files to archive"
+    return included, total_bytes, excluded
+
+
+def attach_workspace_archive(
+    artifacts: StagedTrajectoryArtifacts,
+    folder: Path,
+    *,
+    max_bytes: int | None = None,
+) -> WorkspaceAttachResult:
+    """Zip a workspace folder into the staging area as ``workspace/*.zip``.
+
+    The archive is written inside the staging temporary directory, so it is
+    always deleted when staging exits — success, cancel, or crash alike.
+    Contents are archived as-is (no redaction); callers exclude VCS internals,
+    dependency trees, and secret-shaped filenames via the module exclusion
+    lists and must surface that trade-off to the contributor.
+    """
+    import dataclasses
+    import zipfile
+
+    if max_bytes is None:
+        max_bytes = MAX_ATTACHMENT_BYTES
+
+    def skipped(reason: str) -> WorkspaceAttachResult:
+        return WorkspaceAttachResult(
+            artifacts=artifacts,
+            attached=None,
+            file_count=0,
+            excluded_count=0,
+            skipped_reason=reason,
+        )
+
+    resolved = folder.expanduser()
+    if resolved.is_symlink() or not resolved.is_dir():
+        return skipped(f"workspace folder not found: {resolved}")
+    resolved = resolved.resolve()
+    collected = _collect_workspace_files(resolved, max_bytes=max_bytes)
+    if isinstance(collected, str):
+        return skipped(collected)
+    included, _total_bytes, excluded = collected
+
+    relname = validate_artifact_name(_workspace_archive_name(resolved))
+    target = artifacts._staging_dir / relname
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
+            for source in sorted(included):
+                archive.write(source, arcname=str(source.relative_to(resolved)))
+    except (OSError, ValueError) as exc:
+        target.unlink(missing_ok=True)
+        return skipped(f"could not archive workspace folder: {exc}")
+    if target.stat().st_size > max_bytes:
+        target.unlink(missing_ok=True)
+        return skipped(f"workspace archive exceeds {max_bytes} bytes")
+
+    attached = _staged_file(target, relname, "application/zip")
+    payloads = sorted((*artifacts.files, attached), key=lambda item: item.relname)
+    updated = dataclasses.replace(
+        artifacts,
+        files=tuple(payloads),
+        traj_digest=_trajectory_digest(payloads),
+    )
+    return WorkspaceAttachResult(
+        artifacts=updated,
+        attached=attached,
+        file_count=len(included),
+        excluded_count=excluded,
+        skipped_reason=None,
+    )
 
 
 def finalize_trajectory_capture(
@@ -305,6 +507,7 @@ def finalize_trajectory_capture(
         ignored=artifacts.ignored,
         artifact_redaction_replacements=artifacts.redaction_replacements,
         redaction_replacements=replacement_count,
+        artifact_redaction_categories=artifacts.redaction_categories,
     )
 
 
@@ -430,7 +633,9 @@ def _validate_jsonl(path: Path) -> None:
         raise ValueError(f"trajectory JSONL has no records: {path}")
 
 
-def _redact_jsonl(source: Path, target: Path) -> int:
+def _redact_jsonl(
+    source: Path, target: Path, *, categories: Counter[str] | None = None
+) -> int:
     replacements = 0
     with (
         source.open(encoding="utf-8", newline="") as input_stream,
@@ -443,7 +648,9 @@ def _redact_jsonl(source: Path, target: Path) -> int:
                 continue
             value = strict_json_loads(body)
             try:
-                redacted, count = redact_value_to_stability(value)
+                redacted, count = redact_value_to_stability(
+                    value, categories=categories
+                )
             except RecursionError as exc:  # defense in depth after complexity gate
                 raise ValueError(
                     f"{source}: line {line_number}: trajectory JSONL nesting "
