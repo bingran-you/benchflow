@@ -2,6 +2,99 @@
 
 ## [Unreleased]
 
+### Added
+- **`network_mode: denylist` blocks a list of URLs and hosts for the agent on
+  Docker and Daytona.** The task keeps internet access; `blocked_urls` and
+  `blocked_hosts` are enforced by a root-owned loopback proxy behind the
+  sandbox-user firewall, hosted search tools are switched off per harness,
+  and every refused request lands in `trajectory/egress_denylist.jsonl`.
+  Other backends refuse the mode at preflight. (#1113)
+
+## 0.7.6 — 2026-09-04
+
+### Added
+- **ACP rollout directories render as an interactive reviewer page.**
+  `bench eval view <rollout>` now assembles a JSON payload (normalized
+  events + result/timing/verifier metadata) and renders it client-side in a
+  self-contained template (no build step, zero network requests): full
+  event stream with collapse instead of truncation, harness/model/skills
+  identity row, reward badge and `result.json` failure-diagnostic banners,
+  Verifier and Metrics tabs, Focus/Full modes, per-kind filters and hues,
+  text search, and per-event `#e42` anchors. Trajectory content is treated
+  as untrusted end to end (data-only embedding, `textContent` rendering).
+  Raw session JSONL files and legacy `turn*.txt` runs remain supported, and
+  the `--confirm` approve/reject contract remains compatible.
+- **Directories of rollouts serve a run catalog.** Pointing
+  `bench eval view` at a job directory (or a whole `jobs/` tree) serves a
+  browsable index: corpus counts, grouping by task or model + harness with
+  per-group pass/fail aggregates and pass rates, sorting by
+  name/reward/duration/cost, text filtering, collapsible groups with
+  incremental pagination, and URL-preserved state — selecting a run opens
+  the detail page and the back control restores the exact catalog view.
+  Traces load dynamically from `/api/rollout?id=…` (ids resolve only by
+  exact membership in a fresh directory scan, so crafted ids cannot reach
+  the filesystem) and `?run=<id>` deep-links a run. `--confirm` on a
+  multi-run directory errors out: a confirmation needs exactly one
+  trajectory.
+- **`hf://` sources browse HuggingFace trajectory datasets directly.**
+  `bench eval view hf://<org>/<dataset>[@revision][/subpath]` fetches the
+  viewer-relevant slice of a trajectory dataset into the shared
+  `huggingface_hub` cache and serves it through browse mode, making the
+  community ground-truth uploads reviewable with one command. The download
+  allowlist is exact — trajectories, result/timing/prompts, and the four
+  verifier sidecars the viewer renders — with no wildcards, so large run
+  artifacts and `llm_trajectory`/`trainer` exports are never fetched. The
+  CLI passes the spec as a string into a typed
+  `LocalPathSource | HfDatasetSource` parser (never through `pathlib.Path`,
+  whose normalization would mangle `hf://` into `hf:/`), and dataset
+  subpaths are validated.
+- **The viewer renders per-event timelines the moment captures provide
+  timestamps.** Steps gain a `+m:ss` offset chip and tool calls a duration
+  chip whenever events carry `ts` / `started_at` / `finished_at` fields;
+  with today's captures (which carry none) nothing changes visually.
+- **Z.ai Coding Plan routing.** Coding Plan subscriptions route through the
+  provider layer, with validated generation parameters forwarded and explicit
+  provider endpoints preserved by the LiteLLM proxy. (#1074)
+- **`bench eval run` publishes job artifacts and eval results.**
+  `--publish-bucket` syncs a job directory to a HuggingFace storage bucket (an
+  alternative to `--publish-hf`'s dataset-repo upload), and
+  `--eval-results-model/-dataset/-task` opens a community eval-results PR
+  (`.eval_results/*.yaml`) on a model's HF repo, scored from the run's mean
+  reward. (#1035)
+
+### Fixed
+
+- **`claude-fable-5-1` can run: the `claude-agent-acp` pin moves 0.40.0 to
+  0.73.0.** The old pin bundled `@anthropic-ai/claude-agent-sdk` 0.3.160, and
+  the model rejects Claude Code older than 2.1.251 with
+  `claude_code_version_too_old` (HTTP 400) — so every rollout failed on its
+  first API call. The new pin bundles sdk 0.3.257, and the `set_config_option`
+  `"model"` / `"effort"` wiring is re-verified against it by
+  `tests/test_acp_pinned_protocol_guard.py`. (#1086)
+- **`codex-acp` dispatch modernized.** The shim pin moves to 1.6.0 and
+  reasoning effort travels inside the model id (`modelId[effort]`) through
+  `session/set_model`, rather than a config option the shim rejects. (#1044)
+- **ACP usage and terminal evidence survive an agent timeout**, instead of
+  being dropped with the timed-out turn. (#1080)
+- **A pending tool call can no longer defer the idle watchdog without
+  bound** — the deferral is capped. (#1066)
+- **`bench eval` resume re-runs infra-retryable verifier-errored tasks**
+  rather than treating the infrastructure failure as a settled result. (#1063)
+- **Sandbox hardening execs draw on the verifier-setup budget**, so hardening
+  no longer competes with the agent's own time. (#1062)
+- **`--trials > 1` without `--matrix` is rejected up front.** (#1064)
+- **Healthy native ACP subscription results are preserved.** (#1049)
+- **The agent judge parses native edit targets.** (#1069)
+- **Non-dict rewards no longer break completed-outcome classification.** (#1054)
+- **Codex honors proxy-owned model selection.** (#1076)
+- **Gemini routing corrections.** ACP model ids fixed and wrapped ids
+  normalized, Gemma routing supported with pass-through usage captured, every
+  Google key alias routed through the proxy, Google Gemini gateway routes
+  normalized, and headless runs trust the sandbox workspace.
+- **LiteLLM provisions the Vertex sandbox runtime.** (#985)
+- **OpenClaw caps supported model output tokens.**
+- **RestrictedPython updated to 8.3.**
+
 ## 0.7.5 — 2026-08-19
 
 ### Added
